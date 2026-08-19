@@ -50,22 +50,29 @@ start Xray with that original configuration again.
 ## Fresh-node installation
 
 The installer intentionally refuses to overwrite an existing Xray
-configuration. A suitable REALITY target must be selected and supplied for the
-node; it is not safe for a generic installer to silently choose one for every
-VPS.
+configuration. A suitable REALITY target must be selected for the node; it is
+not safe for a generic installer to silently choose one for every VPS.
 
-After a release exists:
+On a fresh Ubuntu server, copy and paste:
 
 ```bash
-curl -fsSLo /tmp/install-vless.sh \
-  https://raw.githubusercontent.com/akromjon/vless-api/main/install.sh
-
-sudo REALITY_TARGET=www.example.com:443 \
-  PUBLIC_ADDRESS=203.0.113.10 \
-  bash /tmp/install-vless.sh
+curl -sSL https://raw.githubusercontent.com/akromjon/vless-api/main/install.sh -o install.sh
+chmod +x install.sh
+sudo ./install.sh
 ```
 
-For a local binary before the first GitHub release:
+The installer asks for the REALITY target as `hostname:port`. It then detects
+the server's public IPv4 address, generates the API token, downloads the
+matching AMD64 or ARM64 binary from the latest GitHub release, verifies its
+SHA-256 checksum, installs the services, and prints the node credentials.
+
+For unattended installation, provide the target without waiting for a prompt:
+
+```bash
+sudo REALITY_TARGET=your-selected-target.example:443 ./install.sh
+```
+
+For a locally built binary:
 
 ```bash
 GOOS=linux GOARCH=amd64 OUTPUT=vless-api-linux-amd64 ./build.sh

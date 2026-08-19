@@ -123,8 +123,11 @@ if ! command -v systemctl >/dev/null 2>&1; then
 	echo "systemd is required." >&2
 	exit 1
 fi
+if [[ -z "${REALITY_TARGET}" && -t 0 ]]; then
+	read -r -p "REALITY target (hostname:port, usually port 443): " REALITY_TARGET || true
+fi
 if [[ -z "${REALITY_TARGET}" ]]; then
-	echo "REALITY_TARGET is required, for example REALITY_TARGET=www.example.com:443." >&2
+	echo "REALITY_TARGET is required. Run interactively or set REALITY_TARGET=hostname:443." >&2
 	exit 1
 fi
 if [[ ! "${REALITY_TARGET}" =~ ^([A-Za-z0-9.-]+):([0-9]+)$ ]]; then
