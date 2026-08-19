@@ -1,0 +1,26 @@
+[Unit]
+Description=CHOP VLESS Reality node API
+After=network-online.target xray.service
+Wants=network-online.target
+Requires=xray.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/vless-api/.env
+ExecStart=/usr/local/bin/vless-api
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/usr/local/etc/xray
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

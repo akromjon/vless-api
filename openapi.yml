@@ -1,0 +1,200 @@
+openapi: 3.0.3
+info:
+  title: CHOP VLESS Reality Node API
+  version: 0.1.0
+  description: Authenticated API for durable Xray VLESS/REALITY user provisioning.
+  contact:
+    name: GitHub Repository
+    url: https://github.com/akromjon/vless-api
+servers:
+  - url: http://localhost:8080
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: key
+  schemas:
+    Client:
+      type: object
+      required: [name, uuid, protocol, address, port, server_name, reality_public_key, short_id, flow, config]
+      properties:
+        name:
+          type: string
+          pattern: '^[A-Za-z0-9_-]{1,64}$'
+        uuid:
+          type: string
+          format: uuid
+          description: VLESS credential generated separately from the CHOP mobile-user UUID.
+        protocol:
+          type: string
+          enum: [vless-reality]
+        address:
+          type: string
+        port:
+          type: integer
+          example: 443
+        server_name:
+          type: string
+        reality_public_key:
+          type: string
+        short_id:
+          type: string
+        flow:
+          type: string
+          enum: ['', xtls-rprx-vision]
+        config:
+          type: string
+          description: VLESS REALITY share URI.
+    AddUserRequest:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          pattern: '^[A-Za-z0-9_-]{1,64}$'
+    DeleteUserRequest:
+      $ref: '#/components/schemas/AddUserRequest'
+    BulkRequest:
+      type: object
+      required: [names]
+      additionalProperties: false
+      properties:
+        names:
+          type: array
+          minItems: 1
+          maxItems: 500
+          uniqueItems: true
+          items:
+            type: string
+            pattern: '^[A-Za-z0-9_-]{1,64}$'
+    APIResponse:
+      type: object
+      required: [success]
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+        data: {}
+security:
+  - ApiKeyAuth: []
+paths:
+  /api/users:
+    get:
+      summary: List VLESS users
+      operationId: listUsers
+      responses:
+        '200':
+          description: Current durable user list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: {type: boolean}
+                  data:
+                    type: array
+                    items: {$ref: '#/components/schemas/Client'}
+        '404': {description: Missing or invalid API token.}
+  /api/users/add:
+    post:
+      summary: Add one VLESS user
+      operationId: addUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AddUserRequest'}
+      responses:
+        '200':
+          description: User persisted and Xray restarted successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: {type: boolean}
+                  message: {type: string}
+                  data: {$ref: '#/components/schemas/Client'}
+        '400': {description: Invalid name or JSON body.}
+        '404': {description: Missing or invalid API token.}
+        '409': {description: User name already exists.}
+        '500': {description: Configuration validation, persistence, or restart failed.}
+  /api/users/add-bulk:
+    post:
+      summary: Add up to 500 VLESS users with one Xray restart
+      operationId: addUsersBulk
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/BulkRequest'}
+      responses:
+        '200': {description: Per-user results; duplicate existing names may fail individually.}
+        '400': {description: Invalid request.}
+        '404': {description: Missing or invalid API token.}
+        '500': {description: Configuration validation, persistence, or restart failed.}
+  /api/users/delete:
+    post:
+      summary: Delete one VLESS user
+      operationId: deleteUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DeleteUserRequest'}
+      responses:
+        '200': {description: User deleted and Xray restarted successfully.}
+        '404': {description: Invalid token or user not found.}
+        '500': {description: Configuration validation, persistence, or restart failed.}
+  /api/users/delete-all:
+    post:
+      summary: Delete all managed VLESS users
+      operationId: deleteAllUsers
+      responses:
+        '200': {description: All users deleted.}
+        '404': {description: Missing or invalid API token.}
+        '500': {description: Configuration validation, persistence, or restart failed.}
+  /api/health:
+    get:
+      summary: Check Xray service, configuration, and TCP listener
+      operationId: health
+      responses:
+        '200': {description: Health state.}
+        '404': {description: Missing or invalid API token.}
+  /api/status:
+    get:
+      summary: Get VLESS node status
+      operationId: status
+      responses:
+        '200': {description: Node status and public connection metadata.}
+        '404': {description: Missing or invalid API token.}
+  /api/stats:
+    get:
+      summary: Reserved per-user traffic statistics endpoint
+      operationId: stats
+      responses:
+        '501': {description: StatsService is not enabled in version 0.1.0.}
+  /api/start:
+    post:
+      summary: Start Xray
+      operationId: startXray
+      responses:
+        '200': {description: Xray started.}
+        '500': {description: systemd action failed.}
+  /api/stop:
+    post:
+      summary: Stop Xray
+      operationId: stopXray
+      responses:
+        '200': {description: Xray stopped.}
+        '500': {description: systemd action failed.}
+  /api/restart:
+    post:
+      summary: Restart Xray
+      operationId: restartXray
+      responses:
+        '200': {description: Xray restarted.}
+        '500': {description: systemd action failed.}
