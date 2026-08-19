@@ -97,9 +97,9 @@ go vet ./...
 bash -n install.sh build.sh
 ```
 
-The release workflow builds static Linux `amd64` and `arm64` binaries and
-publishes a SHA-256 file beside each binary. `install.sh` verifies that checksum
-before installation.
+Release binaries are built and published manually. A SHA-256 file must be
+published beside each binary because `install.sh` verifies that checksum before
+installation.
 
 ## Next integration stages
 
