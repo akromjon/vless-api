@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -132,6 +133,28 @@ func TestConfigStoreRejectsDuplicateNamesBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestWriteAtomicUsesJSONCandidateSuffix(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "config.json")
+	if err := os.WriteFile(path, []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	validatedPath := ""
+	err := writeAtomic(path, []byte("{\"updated\":true}\n"), 0600, -1, -1, func(candidate string) error {
+		validatedPath = candidate
+		if !strings.HasSuffix(candidate, ".json") {
+			return errors.New("candidate must have .json suffix")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("writeAtomic returned error: %v", err)
+	}
+	if !strings.HasSuffix(validatedPath, ".json") {
+		t.Fatalf("validated candidate %q has no .json suffix", validatedPath)
+	}
+}
+
 func writeTestConfig(t *testing.T) string {
 	t.Helper()
 	directory := t.TempDir()
@@ -141,7 +164,7 @@ func writeTestConfig(t *testing.T) string {
 		"inbounds": []any{map[string]any{
 			"tag":      defaultInboundTag,
 			"protocol": "vless",
-			"settings": map[string]any{"users": []any{}, "decryption": "none"},
+			"settings": map[string]any{"clients": []any{}, "decryption": "none"},
 		}},
 		"outbounds": []any{map[string]any{"protocol": "freedom"}},
 	}

@@ -252,7 +252,9 @@ func (s *ConfigStore) persistAndRestart(document map[string]any, original []byte
 
 func writeAtomic(path string, content []byte, mode os.FileMode, uid, gid int, validate func(string) error) error {
 	directory := filepath.Dir(path)
-	temporary, err := os.CreateTemp(directory, ".vless-api-config-*")
+	// Xray detects the configuration format from the filename, so the
+	// candidate used by `xray run -test` must retain a .json suffix.
+	temporary, err := os.CreateTemp(directory, ".vless-api-config-*.json")
 	if err != nil {
 		return fmt.Errorf("create temporary Xray config: %w", err)
 	}

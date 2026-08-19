@@ -1,4 +1,5 @@
 /vless-api
+/dist/
 *.test
 *.out
 .DS_Store

@@ -61,6 +61,43 @@ func TestAPIBulkRestartsOnce(t *testing.T) {
 	}
 }
 
+func TestHealthRequiresVLESSListener(t *testing.T) {
+	settings := testSettings()
+	settings.VLESSPort = 65432
+	runtime := &fakeRuntime{active: true}
+	store := NewConfigStore(writeTestConfig(t), defaultInboundTag, defaultFlow, runtime)
+	server := NewAPIServer(settings, store, runtime).Handler()
+
+	assertHealth := func(expectedHealthy bool) {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodGet, "/api/health", nil)
+		request.Header.Set("key", settings.APIToken)
+		response := httptest.NewRecorder()
+		server.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", response.Code, response.Body.String())
+		}
+		var body struct {
+			Data struct {
+				Healthy   bool `json:"healthy"`
+				Listening bool `json:"listening"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if body.Data.Healthy != expectedHealthy || body.Data.Listening {
+			t.Fatalf("unexpected health response: %s", response.Body.String())
+		}
+	}
+
+	assertHealth(false)
+	if _, err := store.Add("device_1"); err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+	assertHealth(false)
+}
+
 func testSettings() AppSettings {
 	return AppSettings{
 		APIAddress:       "127.0.0.1",

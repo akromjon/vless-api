@@ -79,7 +79,9 @@ sudo REALITY_TARGET=www.example.com:443 \
 The installer:
 
 1. Installs Xray using the official
-   [`XTLS/Xray-install`](https://github.com/XTLS/Xray-install) project.
+   [`XTLS/Xray-install`](https://github.com/XTLS/Xray-install) project. The
+   tested Xray version is pinned by default and can be changed with
+   `XRAY_VERSION`.
 2. Generates the REALITY X25519 key pair and short ID on the node.
 3. Creates an empty VLESS/REALITY TCP 443 inbound.
 4. Installs `vless-api` and its root-only environment file.

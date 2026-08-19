@@ -4,6 +4,7 @@ set -Eeuo pipefail
 SCRIPT_VERSION="0.1.0"
 REPOSITORY="akromjon/vless-api"
 XRAY_INSTALL_URL="${XRAY_INSTALL_URL:-https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh}"
+XRAY_VERSION="${XRAY_VERSION:-v26.3.27}"
 
 API_PORT="${API_PORT:-8080}"
 VLESS_PORT="${VLESS_PORT:-443}"
@@ -147,6 +148,10 @@ if [[ "${VLESS_FLOW}" != "xtls-rprx-vision" && -n "${VLESS_FLOW}" ]]; then
 	echo "VLESS_FLOW must be empty or xtls-rprx-vision." >&2
 	exit 1
 fi
+if [[ ! "${XRAY_VERSION}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+	echo "XRAY_VERSION must be a release such as v26.3.27." >&2
+	exit 1
+fi
 if [[ ! "${VLESS_INBOUND_TAG}" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
 	echo "VLESS_INBOUND_TAG contains unsupported characters." >&2
 	exit 1
@@ -181,7 +186,7 @@ fi
 
 temporary_directory="$(mktemp -d)"
 curl -fsSL --retry 3 -o "${temporary_directory}/xray-install.sh" "${XRAY_INSTALL_URL}"
-bash "${temporary_directory}/xray-install.sh" install --install-user xray
+bash "${temporary_directory}/xray-install.sh" install --install-user xray --version "${XRAY_VERSION}"
 
 key_output="$(/usr/local/bin/xray x25519)"
 reality_private_key="$(awk -F': ' '/^PrivateKey:/ {print $2}' <<<"${key_output}")"
@@ -206,7 +211,7 @@ cat >"${config_candidate}" <<EOF
       "port": ${VLESS_PORT},
       "protocol": "vless",
       "settings": {
-        "users": [],
+        "clients": [],
         "decryption": "none"
       },
       "streamSettings": {
@@ -269,8 +274,7 @@ cat >"${API_SERVICE_FILE}" <<EOF
 [Unit]
 Description=CHOP VLESS Reality node API
 After=network-online.target xray.service
-Wants=network-online.target
-Requires=xray.service
+Wants=network-online.target xray.service
 
 [Service]
 Type=simple
@@ -296,10 +300,19 @@ EOF
 chmod 0644 "${API_SERVICE_FILE}"
 
 systemctl daemon-reload
-systemctl enable --now xray.service
+systemctl enable xray.service
+systemctl restart xray.service
 systemctl enable --now vless-api.service
 
-health_response="$(curl -fsS --max-time 5 -H "key: ${API_TOKEN}" "http://127.0.0.1:${API_PORT}/api/health")"
+health_response=""
+for _ in {1..20}; do
+	if health_response="$(curl -fsS --max-time 2 -H "key: ${API_TOKEN}" "http://127.0.0.1:${API_PORT}/api/health" 2>/dev/null)"; then
+		if [[ "${health_response}" == *'"healthy":true'* ]]; then
+			break
+		fi
+	fi
+	sleep 1
+done
 if [[ "${health_response}" != *'"healthy":true'* ]]; then
 	echo "Node API health verification failed: ${health_response}" >&2
 	exit 1

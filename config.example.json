@@ -9,7 +9,7 @@
       "port": 443,
       "protocol": "vless",
       "settings": {
-        "users": [],
+        "clients": [],
         "decryption": "none"
       },
       "streamSettings": {
