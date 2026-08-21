@@ -36,16 +36,68 @@ All endpoints require the same `key: <API_TOKEN>` header shape used by
 | `POST` | `/api/users/add` | Add one user from `{"name":"config_123"}` |
 | `POST` | `/api/users/add-bulk` | Add up to 500 names with one Xray restart |
 | `POST` | `/api/users/delete` | Delete one user by name |
+| `POST` | `/api/users/rotate` | Issue a fresh VLESS UUID for an existing name, revoking the old one |
 | `POST` | `/api/users/delete-all` | Delete every managed user |
 | `GET` | `/api/health` | Check config, Xray service, and TCP listener |
 | `GET` | `/api/status` | Return node/protocol metadata |
 | `POST` | `/api/start`, `/api/stop`, `/api/restart` | Control Xray |
-| `GET` | `/api/stats` | Reserved; returns 501 in this first version |
+| `GET` | `/api/stats` | Per-config traffic counters; `?reset=1` returns deltas. 501 until the Xray API is enabled |
 
 User mutations are durable. The API writes a temporary configuration, asks
-Xray to validate it, atomically replaces the active file, and restarts Xray.
-If the restart fails, it restores the original configuration and attempts to
-start Xray with that original configuration again.
+Xray to validate it, and atomically replaces the active file. How the running
+process is then brought in step depends on whether Xray's gRPC API is enabled:
+
+- **With the API** (`XRAY_API_ADDRESS`, default `127.0.0.1:10085`): users are
+  added and removed on the live inbound through `HandlerService`. Xray is never
+  restarted, so other users' sessions survive. This is what makes per-release
+  credential rotation affordable — without it, rotating one config would
+  disconnect every other user on the node.
+- **Without it**: Xray is restarted, exactly as before. If the restart fails the
+  original configuration is restored and Xray is started with it again.
+
+If a live apply fails, the file is restored and Xray restarted, so the file and
+the running process can never silently disagree.
+
+Runtime changes made over the API are not persisted by Xray, which is why the
+configuration file is always written first and remains the source of truth
+across restarts.
+
+## Enabling the Xray API on a node
+
+`/api/stats` and restart-free user changes both require these blocks in the
+node's `config.json`, plus a restart to pick them up:
+
+```json
+{
+  "api":    { "tag": "api", "services": ["HandlerService", "StatsService"] },
+  "stats":  {},
+  "policy": {
+    "levels": { "0": { "statsUserUplink": true, "statsUserDownlink": true } },
+    "system": { "statsInboundUplink": true, "statsInboundDownlink": true }
+  },
+  "routing": { "rules": [ { "type": "field", "inboundTag": ["api"], "outboundTag": "api" } ] }
+}
+```
+
+and an extra inbound, appended **after** the VLESS one:
+
+```json
+{ "tag": "api", "port": 10085, "listen": "127.0.0.1", "protocol": "dokodemo-door",
+  "settings": { "address": "127.0.0.1" } }
+```
+
+The inbound is looked up by tag, not by position, so appending is safe. Counters
+live in memory: a restart resets them, so a consumer must read a decrease as a
+restart rather than as negative traffic.
+
+## Client fingerprint
+
+`VLESS_FINGERPRINT` (default `chrome`) sets the `fp` parameter of the generated
+`vless://` URI. Chrome's uTLS profile carries a post-quantum key share, which
+pushes the REALITY ClientHello past one MSS and splits it across two TCP
+segments. On paths where a middlebox drops the second segment, the handshake
+never completes and the client stalls with no reply. Set `ios` or `safari` on
+nodes serving such paths to keep the ClientHello in a single segment.
 
 ## Fresh-node installation
 
@@ -98,12 +150,64 @@ Open TCP 443 to VPN clients. TCP 8080 should be restricted at the provider
 firewall to the CHOP backend addresses even though the API also requires a
 token.
 
+## Transparent TCP relay installation
+
+Run the relay installer on a separate VPS whose public IP will be shown to
+clients. The real VLESS node keeps the REALITY keys, users, TCP 443 listener,
+and management API; the relay only forwards raw TCP to it.
+
+On a fresh Ubuntu relay VPS:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/akromjon/vless-api/main/install-relay.sh -o install-relay.sh
+chmod +x install-relay.sh
+
+sudo ORIGIN_HOST=203.0.113.10 \
+  ORIGIN_PORT=443 \
+  RELAY_PORT=443 \
+  ./install-relay.sh
+```
+
+`ORIGIN_HOST` is the real VLESS node IP or hostname. Prefer relay TCP 443 when
+it is available; choose another port such as `8444` if another service already
+owns 443. The installer refuses port conflicts and forwarding loops, verifies
+that the origin is reachable before changing the VPS, installs Xray when
+needed, creates a dedicated hardened systemd service, and rotates its access
+and error logs daily. Re-running the same command verifies and restarts the
+same configuration; different settings are not silently overwritten.
+
+To run more than one isolated relay on the same VPS, give each one a unique
+lowercase name and port:
+
+```bash
+sudo RELAY_NAME=zurich-vless-relay \
+  ORIGIN_HOST=203.0.113.10 \
+  RELAY_PORT=8444 \
+  ./install-relay.sh
+```
+
+After installation, edit the **real VLESS server record** in CHOP admin:
+
+| CHOP field | Value |
+| --- | --- |
+| Server IP | Real VLESS node IP; do not change it to the relay |
+| API port | Real node management API, normally `8080` |
+| Relay host | Relay VPS public IP printed by the installer |
+| Relay port | `RELAY_PORT` used by the installer |
+
+Do not create a second CHOP server record for the relay. Open the relay port to
+clients, allow the relay VPS to reach the origin's TCP 443, and keep the origin
+API restricted to the CHOP backend. For a fresh node with no direct clients,
+the origin's TCP 443 can additionally be restricted to the relay IP after the
+end-to-end connection test passes.
+
 ## Development
 
 ```bash
 go test ./...
 go vet ./...
-bash -n install.sh build.sh
+bash -n install.sh install-relay.sh build.sh
+shellcheck install.sh install-relay.sh build.sh
 ```
 
 Release binaries are built and published manually. A SHA-256 file must be

@@ -15,6 +15,7 @@ type APIServer struct {
 	settings AppSettings
 	store    *ConfigStore
 	runtime  XrayRuntime
+	liveAPI  XrayLiveAPI
 }
 
 type APIResponse struct {
@@ -40,12 +41,20 @@ func NewAPIServer(settings AppSettings, store *ConfigStore, runtime XrayRuntime)
 	return &APIServer{settings: settings, store: store, runtime: runtime}
 }
 
+// WithLiveAPI enables the endpoints that need Xray's gRPC API. Left unset,
+// /api/stats keeps returning 501 exactly as it did before.
+func (s *APIServer) WithLiveAPI(api XrayLiveAPI) *APIServer {
+	s.liveAPI = api
+	return s
+}
+
 func (s *APIServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/users", s.require(http.MethodGet, s.listUsers))
 	mux.HandleFunc("/api/users/add", s.require(http.MethodPost, s.addUser))
 	mux.HandleFunc("/api/users/add-bulk", s.require(http.MethodPost, s.addUsersBulk))
 	mux.HandleFunc("/api/users/delete", s.require(http.MethodPost, s.deleteUser))
+	mux.HandleFunc("/api/users/rotate", s.require(http.MethodPost, s.rotateUser))
 	mux.HandleFunc("/api/users/delete-all", s.require(http.MethodPost, s.deleteAllUsers))
 	mux.HandleFunc("/api/health", s.require(http.MethodGet, s.health))
 	mux.HandleFunc("/api/status", s.require(http.MethodGet, s.status))
@@ -172,6 +181,32 @@ func (s *APIServer) deleteUser(writer http.ResponseWriter, request *http.Request
 	writeJSON(writer, http.StatusOK, APIResponse{Success: true, Message: "user deleted"})
 }
 
+// rotateUser replaces one config's VLESS UUID and returns the new share URI.
+// The response mirrors /api/users/add so the backend can store it the same way.
+func (s *APIServer) rotateUser(writer http.ResponseWriter, request *http.Request) {
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := decodeBody(request, &body); err != nil {
+		writeError(writer, http.StatusBadRequest, err)
+		return
+	}
+	record, err := s.store.Rotate(body.Name)
+	if errors.Is(err, ErrUserNotFound) {
+		writeError(writer, http.StatusNotFound, err)
+		return
+	}
+	if err != nil {
+		writeError(writer, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, APIResponse{
+		Success: true,
+		Message: "user rotated",
+		Data:    s.clientResponse(record),
+	})
+}
+
 func (s *APIServer) deleteAllUsers(writer http.ResponseWriter, _ *http.Request) {
 	deleted, err := s.store.DeleteAll()
 	if err != nil {
@@ -235,11 +270,49 @@ func (s *APIServer) status(writer http.ResponseWriter, _ *http.Request) {
 	}})
 }
 
-func (s *APIServer) stats(writer http.ResponseWriter, _ *http.Request) {
-	writeJSON(writer, http.StatusNotImplemented, APIResponse{
-		Success: false,
-		Message: "per-user Xray traffic statistics are not enabled in the initial durable-config implementation",
-	})
+// stats reports per-config byte counters from Xray's StatsService.
+//
+// `?reset=1` zeroes the counters as it reads them, so a caller polling on a
+// fixed interval gets deltas for that interval. Without it the values are
+// cumulative since Xray last started. Counters live in memory only: a restart
+// loses them, so a consumer must treat a decrease as a restart, not as
+// negative traffic.
+//
+// A config with no traffic since the last reset is absent from the list rather
+// than reported as zero -- Xray does not materialise a counter until it moves.
+func (s *APIServer) stats(writer http.ResponseWriter, request *http.Request) {
+	if s.liveAPI == nil || !s.liveAPI.Available() {
+		writeJSON(writer, http.StatusNotImplemented, APIResponse{
+			Success: false,
+			Message: "per-user Xray traffic statistics are not enabled on this node: set XRAY_API_ADDRESS and add api/stats/policy blocks to the Xray configuration",
+		})
+		return
+	}
+
+	reset := false
+	switch strings.ToLower(strings.TrimSpace(request.URL.Query().Get("reset"))) {
+	case "1", "true", "yes":
+		reset = true
+	}
+
+	traffic, err := s.liveAPI.UserTraffic(reset)
+	if err != nil {
+		writeError(writer, http.StatusInternalServerError, err)
+		return
+	}
+
+	var uplink, downlink int64
+	for _, entry := range traffic {
+		uplink += entry.Uplink
+		downlink += entry.Downlink
+	}
+	writeJSON(writer, http.StatusOK, APIResponse{Success: true, Data: map[string]any{
+		"reset":          reset,
+		"users":          traffic,
+		"active_users":   len(traffic),
+		"total_uplink":   uplink,
+		"total_downlink": downlink,
+	}})
 }
 
 func (s *APIServer) start(writer http.ResponseWriter, _ *http.Request) {

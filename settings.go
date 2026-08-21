@@ -17,7 +17,26 @@ const (
 	defaultVLESSPort  = 443
 	defaultFlow       = "xtls-rprx-vision"
 	defaultInboundTag = "vless-reality"
+	defaultAPIServer  = "127.0.0.1:10085"
+
+	// Kept at "chrome" so an existing node's generated URIs do not change
+	// shape on upgrade. Chrome's uTLS profile carries a post-quantum key
+	// share, which pushes the REALITY ClientHello past one MSS and splits it
+	// across two TCP segments; on paths where a middlebox drops the second
+	// segment the handshake never completes. Set VLESS_FINGERPRINT=ios (or
+	// safari) on nodes serving such paths to keep the ClientHello in a single
+	// segment.
+	defaultFingerprint = "chrome"
 )
+
+// uTLS profiles Xray accepts. Anything outside this set is silently ignored by
+// the client, which would leave the fingerprint at Xray's own default without
+// any signal that the setting did nothing.
+var supportedFingerprints = map[string]bool{
+	"chrome": true, "firefox": true, "safari": true, "ios": true,
+	"android": true, "edge": true, "360": true, "qq": true,
+	"random": true, "randomized": true,
+}
 
 var shortIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{2,16}$`)
 
@@ -36,6 +55,8 @@ type AppSettings struct {
 	RealityPublicKey string
 	ShortID          string
 	Flow             string
+	Fingerprint      string
+	XrayAPIAddress   string
 }
 
 func loadSettings() (AppSettings, error) {
@@ -54,6 +75,8 @@ func loadSettings() (AppSettings, error) {
 		RealityPublicKey: strings.TrimSpace(os.Getenv("VLESS_REALITY_PUBLIC_KEY")),
 		ShortID:          strings.ToLower(strings.TrimSpace(os.Getenv("VLESS_SHORT_ID"))),
 		Flow:             envOr("VLESS_FLOW", defaultFlow),
+		Fingerprint:      strings.ToLower(envOr("VLESS_FINGERPRINT", defaultFingerprint)),
+		XrayAPIAddress:   strings.TrimSpace(envOr("XRAY_API_ADDRESS", defaultAPIServer)),
 	}
 
 	if err := settings.Validate(); err != nil {
@@ -89,6 +112,9 @@ func (s AppSettings) Validate() error {
 	if s.Flow != "" && s.Flow != defaultFlow {
 		return fmt.Errorf("VLESS_FLOW must be empty or %q", defaultFlow)
 	}
+	if !supportedFingerprints[s.Fingerprint] {
+		return fmt.Errorf("VLESS_FINGERPRINT %q is not a uTLS profile Xray understands", s.Fingerprint)
+	}
 	if strings.TrimSpace(s.XrayConfigFile) == "" || strings.TrimSpace(s.InboundTag) == "" {
 		return fmt.Errorf("XRAY_CONFIG_FILE and VLESS_INBOUND_TAG are required")
 	}
@@ -111,7 +137,7 @@ func (s AppSettings) BuildShareURI(record UserRecord) string {
 	}
 	query.Set("security", "reality")
 	query.Set("sni", s.ServerName)
-	query.Set("fp", "chrome")
+	query.Set("fp", s.Fingerprint)
 	query.Set("pbk", s.RealityPublicKey)
 	query.Set("sid", s.ShortID)
 	query.Set("type", "tcp")

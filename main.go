@@ -22,12 +22,30 @@ func main() {
 		ServiceName:     settings.XrayService,
 		Timeout:         15 * time.Second,
 	}
+	// A configured API address is only a claim. Probe it, and treat a failure
+	// as "this node has no Xray API" -- otherwise every user change would try
+	// a live apply, fail, and restart Xray to reconcile.
+	liveAPI := CommandLiveAPI{Runtime: runtime, APIAddress: settings.XrayAPIAddress}
+	liveEnabled := liveAPI.Available()
+	if liveEnabled {
+		if err := liveAPI.Probe(settings.InboundTag); err != nil {
+			log.Printf("Xray API at %s did not answer (%v): falling back to restart-based user changes", settings.XrayAPIAddress, err)
+			liveEnabled = false
+		}
+	}
+
 	store := NewConfigStore(settings.XrayConfigFile, settings.InboundTag, settings.Flow, runtime)
+	if liveEnabled {
+		store = store.WithLiveAPI(liveAPI, settings.VLESSPort)
+	}
 	if _, err := store.List(); err != nil {
 		log.Fatalf("cannot load managed Xray users: %v", err)
 	}
 
 	api := NewAPIServer(settings, store, runtime)
+	if liveEnabled {
+		api = api.WithLiveAPI(liveAPI)
+	}
 	server := &http.Server{
 		Addr:              settings.APIListenAddress(),
 		Handler:           api.Handler(),
@@ -48,6 +66,11 @@ func main() {
 		}
 	}()
 
+	if liveEnabled {
+		log.Printf("Xray gRPC API at %s: user changes apply without a restart", settings.XrayAPIAddress)
+	} else {
+		log.Printf("Xray gRPC API disabled: every user change restarts Xray and drops live sessions")
+	}
 	log.Printf("VLESS API listening on %s and managing inbound %q", settings.APIListenAddress(), settings.InboundTag)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Printf("HTTP server failed: %v", err)

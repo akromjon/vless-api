@@ -40,11 +40,34 @@ type ConfigStore struct {
 	inboundTag string
 	flow       string
 	runtime    XrayRuntime
+	liveAPI    XrayLiveAPI
+	vlessPort  int
 	mu         sync.Mutex
+}
+
+// userDelta is the exact set of users a mutation added or removed. The live
+// apply path needs it because Xray's HandlerService works per user; it cannot
+// diff a whole config document the way a restart implicitly does.
+type userDelta struct {
+	added   []UserRecord
+	removed []string
+}
+
+func (d userDelta) empty() bool {
+	return len(d.added) == 0 && len(d.removed) == 0
 }
 
 func NewConfigStore(path, inboundTag, flow string, runtime XrayRuntime) *ConfigStore {
 	return &ConfigStore{path: path, inboundTag: inboundTag, flow: flow, runtime: runtime}
+}
+
+// WithLiveAPI opts the store into restart-free mutations. Without it every
+// change falls back to a full Xray restart, which drops every established
+// session on the node.
+func (s *ConfigStore) WithLiveAPI(api XrayLiveAPI, vlessPort int) *ConfigStore {
+	s.liveAPI = api
+	s.vlessPort = vlessPort
+	return s
 }
 
 func (s *ConfigStore) Path() string {
@@ -111,6 +134,7 @@ func (s *ConfigStore) AddBulk(names []string) ([]BulkUserResult, error) {
 	}
 
 	results := make([]BulkUserResult, 0, len(names))
+	added := make([]UserRecord, 0, len(names))
 	changed := false
 	for _, name := range names {
 		if _, found := existing[name]; found {
@@ -132,6 +156,7 @@ func (s *ConfigStore) AddBulk(names []string) ([]BulkUserResult, error) {
 		users.values = append(users.values, user)
 		existing[name] = struct{}{}
 		changed = true
+		added = append(added, record)
 		results = append(results, BulkUserResult{Name: name, Success: true, Message: "user added", User: record})
 	}
 
@@ -139,7 +164,7 @@ func (s *ConfigStore) AddBulk(names []string) ([]BulkUserResult, error) {
 		return results, nil
 	}
 	users.commit()
-	if err := s.persistAndRestart(document, original); err != nil {
+	if err := s.persistAndApply(document, original, userDelta{added: added}); err != nil {
 		return nil, err
 	}
 	return results, nil
@@ -178,7 +203,71 @@ func (s *ConfigStore) Delete(name string) error {
 	}
 	users.values = filtered
 	users.commit()
-	return s.persistAndRestart(document, original)
+	return s.persistAndApply(document, original, userDelta{removed: []string{name}})
+}
+
+// Rotate issues a fresh VLESS UUID for an existing config name, revoking the
+// old one. The name is the stable identity the backend keys on; only the secret
+// changes, so the caller updates the stored share URI and nothing else.
+//
+// This is the operation that makes returning a released config to the pool safe.
+// Unlike a WireGuard peer, a VLESS credential keeps working for whoever still
+// holds it, so handing an un-rotated config to the next user puts two devices on
+// one identity.
+//
+// The user keeps its position in the client list: a rotation is a secret change,
+// not a re-registration.
+func (s *ConfigStore) Rotate(name string) (UserRecord, error) {
+	if err := validateUserName(name); err != nil {
+		return UserRecord{}, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	document, original, err := s.load()
+	if err != nil {
+		return UserRecord{}, err
+	}
+	users, err := findUserList(document, s.inboundTag)
+	if err != nil {
+		return UserRecord{}, err
+	}
+
+	id, err := randomUUID()
+	if err != nil {
+		return UserRecord{}, fmt.Errorf("generate UUID for %s: %w", name, err)
+	}
+
+	found := false
+	for _, raw := range users.values {
+		user, ok := raw.(map[string]any)
+		if !ok {
+			return UserRecord{}, fmt.Errorf("invalid user entry in Xray config")
+		}
+		if stringValue(user["email"]) != name {
+			continue
+		}
+		user["id"] = id
+		found = true
+		break
+	}
+	if !found {
+		return UserRecord{}, ErrUserNotFound
+	}
+
+	record := UserRecord{Name: name, UUID: id}
+	users.commit()
+	// Removal must precede the addition, or the live apply would register the
+	// new secret and then immediately revoke it by name. applyLive enforces
+	// that order.
+	if err := s.persistAndApply(document, original, userDelta{
+		removed: []string{name},
+		added:   []UserRecord{record},
+	}); err != nil {
+		return UserRecord{}, err
+	}
+	return record, nil
 }
 
 func (s *ConfigStore) DeleteAll() (int, error) {
@@ -197,9 +286,17 @@ func (s *ConfigStore) DeleteAll() (int, error) {
 	if deleted == 0 {
 		return 0, nil
 	}
+	removed := make([]string, 0, deleted)
+	for _, raw := range users.values {
+		if user, ok := raw.(map[string]any); ok {
+			if email := stringValue(user["email"]); email != "" {
+				removed = append(removed, email)
+			}
+		}
+	}
 	users.values = []any{}
 	users.commit()
-	if err := s.persistAndRestart(document, original); err != nil {
+	if err := s.persistAndApply(document, original, userDelta{removed: removed}); err != nil {
 		return 0, err
 	}
 	return deleted, nil
@@ -217,29 +314,52 @@ func (s *ConfigStore) load() (map[string]any, []byte, error) {
 	return document, original, nil
 }
 
-func (s *ConfigStore) persistAndRestart(document map[string]any, original []byte) error {
+// persistAndApply writes the new configuration, then brings the RUNNING Xray
+// in step with it. The file is always written first: it is the source of truth
+// across restarts, and a live-only change would silently vanish on the next
+// reboot.
+//
+// With the live API available the running instance is updated per user and is
+// never restarted, so other users' sessions survive. That is what makes
+// per-release credential rotation affordable. Without it we fall back to the
+// original restart, which drops every established session on the node.
+func (s *ConfigStore) persistAndApply(document map[string]any, original []byte, delta userDelta) error {
 	updated, err := json.MarshalIndent(document, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode Xray config: %w", err)
 	}
 	updated = append(updated, '\n')
 
-	mode := os.FileMode(0600)
-	uid, gid := -1, -1
-	if info, err := os.Stat(s.path); err == nil {
-		mode = info.Mode().Perm()
-		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-			uid, gid = int(stat.Uid), int(stat.Gid)
-		}
-	}
+	mode, uid, gid := s.fileOwnership()
 	if err := writeAtomic(s.path, updated, mode, uid, gid, s.runtime.Validate); err != nil {
 		return err
 	}
+	restore := func() error {
+		return writeAtomic(s.path, original, mode, uid, gid, s.runtime.Validate)
+	}
+
+	if s.liveAPI != nil && s.liveAPI.Available() && !delta.empty() {
+		if err := s.applyLive(delta); err != nil {
+			// The file no longer matches the running instance. Put the file
+			// back and restart so the two agree again, even though that costs
+			// the node's sessions -- a silent mismatch is worse.
+			rollbackErr := restore()
+			if rollbackErr == nil {
+				rollbackErr = s.runtime.Restart()
+			}
+			if rollbackErr != nil {
+				return fmt.Errorf("apply Xray users: %v; rollback also failed: %w", err, rollbackErr)
+			}
+			return fmt.Errorf("apply Xray users: %v; original configuration restored", err)
+		}
+		return nil
+	}
+
 	if err := s.runtime.Restart(); err == nil {
 		return nil
 	} else {
 		restartErr := err
-		rollbackErr := writeAtomic(s.path, original, mode, uid, gid, s.runtime.Validate)
+		rollbackErr := restore()
 		if rollbackErr == nil {
 			rollbackErr = s.runtime.Restart()
 		}
@@ -248,6 +368,35 @@ func (s *ConfigStore) persistAndRestart(document map[string]any, original []byte
 		}
 		return fmt.Errorf("restart Xray: %v; original configuration restored", restartErr)
 	}
+}
+
+// applyLive removes before it adds. A rotation is a remove plus an add of the
+// SAME name; adding first would leave the new credential in place only to have
+// the removal take it straight back out.
+func (s *ConfigStore) applyLive(delta userDelta) error {
+	if len(delta.removed) > 0 {
+		if err := s.liveAPI.RemoveUsers(s.inboundTag, delta.removed); err != nil {
+			return err
+		}
+	}
+	if len(delta.added) > 0 {
+		if err := s.liveAPI.AddUsers(s.inboundTag, s.vlessPort, s.flow, delta.added); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *ConfigStore) fileOwnership() (os.FileMode, int, int) {
+	mode := os.FileMode(0600)
+	uid, gid := -1, -1
+	if info, err := os.Stat(s.path); err == nil {
+		mode = info.Mode().Perm()
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+			uid, gid = int(stat.Uid), int(stat.Gid)
+		}
+	}
+	return mode, uid, gid
 }
 
 func writeAtomic(path string, content []byte, mode os.FileMode, uid, gid int, validate func(string) error) error {

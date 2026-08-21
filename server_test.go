@@ -114,5 +114,7 @@ func testSettings() AppSettings {
 		RealityPublicKey: "public-key",
 		ShortID:          "0123456789abcdef",
 		Flow:             defaultFlow,
+		Fingerprint:      defaultFingerprint,
+		XrayAPIAddress:   defaultAPIServer,
 	}
 }
