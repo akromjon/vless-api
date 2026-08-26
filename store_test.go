@@ -371,3 +371,170 @@ func TestProbeFailureKeepsStoreOnRestartPath(t *testing.T) {
 		t.Fatalf("live API must not be used after a failed probe, got %#v", live.added)
 	}
 }
+
+const wsInboundTag = "ws-in"
+
+func writeTestConfigWithWs(t *testing.T) string {
+	t.Helper()
+	directory := t.TempDir()
+	path := filepath.Join(directory, "config.json")
+	document := map[string]any{
+		"log": map[string]any{"loglevel": "warning"},
+		"inbounds": []any{
+			map[string]any{
+				"tag":      defaultInboundTag,
+				"protocol": "vless",
+				"settings": map[string]any{"clients": []any{}, "decryption": "none"},
+			},
+			map[string]any{
+				"tag":      wsInboundTag,
+				"protocol": "vless",
+				"settings": map[string]any{"clients": []any{}, "decryption": "none"},
+			},
+		},
+		"outbounds": []any{map[string]any{"protocol": "freedom"}},
+	}
+	content, err := json.MarshalIndent(document, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	content = append(content, '\n')
+	if err := os.WriteFile(path, content, 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func readInboundClients(t *testing.T, path, tag string) []any {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(raw, &document); err != nil {
+		t.Fatal(err)
+	}
+	for _, rawInbound := range document["inbounds"].([]any) {
+		inbound := rawInbound.(map[string]any)
+		if stringValue(inbound["tag"]) == tag {
+			settings := inbound["settings"].(map[string]any)
+			return settings["clients"].([]any)
+		}
+	}
+	t.Fatalf("inbound %q not found in %s", tag, path)
+	return nil
+}
+
+// A node with a ws-in inbound must have every REALITY user mirrored into it.
+// Without this, vless-api adds new users only to the REALITY inbound and
+// ws-in silently drifts -- real users allocated after the fact never get ws
+// access at all.
+func TestConfigStoreMirrorsAddIntoWsInbound(t *testing.T) {
+	path := writeTestConfigWithWs(t)
+	store := NewConfigStore(path, defaultInboundTag, defaultFlow, &fakeRuntime{active: true}).
+		WithWsInbound(wsInboundTag, 8080)
+
+	if _, err := store.AddBulk([]string{"device_1"}); err != nil {
+		t.Fatalf("AddBulk returned error: %v", err)
+	}
+
+	primary := readInboundClients(t, path, defaultInboundTag)
+	ws := readInboundClients(t, path, wsInboundTag)
+	if len(primary) != 1 || len(ws) != 1 {
+		t.Fatalf("expected one user mirrored into both inbounds, got primary=%d ws=%d", len(primary), len(ws))
+	}
+	primaryUser := primary[0].(map[string]any)
+	wsUser := ws[0].(map[string]any)
+	if primaryUser["id"] != wsUser["id"] || primaryUser["email"] != wsUser["email"] {
+		t.Fatalf("ws user must match the primary inbound's identity, got primary=%#v ws=%#v", primaryUser, wsUser)
+	}
+	if _, hasFlow := wsUser["flow"]; hasFlow {
+		t.Fatalf("ws-in must not carry a flow field, got %#v", wsUser)
+	}
+}
+
+// Deletion must remove the user from ws-in too, or a revoked credential
+// keeps working over the ws transport.
+func TestConfigStoreMirrorsDeleteIntoWsInbound(t *testing.T) {
+	path := writeTestConfigWithWs(t)
+	store := NewConfigStore(path, defaultInboundTag, defaultFlow, &fakeRuntime{active: true}).
+		WithWsInbound(wsInboundTag, 8080)
+	if _, err := store.Add("device_1"); err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+
+	if err := store.Delete("device_1"); err != nil {
+		t.Fatalf("Delete returned error: %v", err)
+	}
+
+	if ws := readInboundClients(t, path, wsInboundTag); len(ws) != 0 {
+		t.Fatalf("expected ws-in emptied after delete, got %#v", ws)
+	}
+}
+
+// Rotation changes the secret in place; the ws inbound must pick up the same
+// new UUID under the same name, not be left holding the revoked one.
+func TestConfigStoreMirrorsRotateIntoWsInbound(t *testing.T) {
+	path := writeTestConfigWithWs(t)
+	store := NewConfigStore(path, defaultInboundTag, defaultFlow, &fakeRuntime{active: true}).
+		WithWsInbound(wsInboundTag, 8080)
+	original, err := store.Add("device_1")
+	if err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+
+	rotated, err := store.Rotate("device_1")
+	if err != nil {
+		t.Fatalf("Rotate returned error: %v", err)
+	}
+	if rotated.UUID == original.UUID {
+		t.Fatal("rotation must issue a new UUID")
+	}
+
+	ws := readInboundClients(t, path, wsInboundTag)
+	if len(ws) != 1 {
+		t.Fatalf("expected exactly one ws-in user after rotation, got %d", len(ws))
+	}
+	if ws[0].(map[string]any)["id"] != rotated.UUID {
+		t.Fatalf("ws-in must carry the rotated UUID, got %#v", ws[0])
+	}
+}
+
+// A node mid-migration -- WS_INBOUND_TAG configured but the inbound not yet
+// present in the file -- must not fail user mutations. The absence is
+// expected, not a misconfiguration.
+func TestConfigStoreToleratesMissingWsInbound(t *testing.T) {
+	path := writeTestConfig(t)
+	store := NewConfigStore(path, defaultInboundTag, defaultFlow, &fakeRuntime{active: true}).
+		WithWsInbound(wsInboundTag, 8080)
+
+	if _, err := store.AddBulk([]string{"device_1"}); err != nil {
+		t.Fatalf("expected a missing ws-in inbound to be tolerated, got error: %v", err)
+	}
+}
+
+// With the live API wired in, both the REALITY and ws inbounds must receive
+// the same add/remove call through HandlerService -- this is what keeps a
+// node's ws transport in sync with its REALITY transport without a restart.
+func TestConfigStoreMirrorsLiveApplyToWsInbound(t *testing.T) {
+	path := writeTestConfigWithWs(t)
+	live := &fakeLiveAPI{available: true}
+	store := NewConfigStore(path, defaultInboundTag, defaultFlow, &fakeRuntime{active: true}).
+		WithLiveAPI(live, 443).
+		WithWsInbound(wsInboundTag, 8080)
+
+	if _, err := store.AddBulk([]string{"device_1"}); err != nil {
+		t.Fatalf("AddBulk returned error: %v", err)
+	}
+	if len(live.added) != 2 || live.addedTags[0] != defaultInboundTag || live.addedTags[1] != wsInboundTag {
+		t.Fatalf("expected AddUsers on both inbounds, got tags=%#v", live.addedTags)
+	}
+
+	if err := store.Delete("device_1"); err != nil {
+		t.Fatalf("Delete returned error: %v", err)
+	}
+	if len(live.removed) != 2 || live.removedTags[0] != defaultInboundTag || live.removedTags[1] != wsInboundTag {
+		t.Fatalf("expected RemoveUsers on both inbounds, got tags=%#v", live.removedTags)
+	}
+}

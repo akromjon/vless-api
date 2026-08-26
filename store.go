@@ -19,8 +19,9 @@ const maxBulkUsers = 500
 var userNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 var (
-	ErrUserExists   = errors.New("user already exists")
-	ErrUserNotFound = errors.New("user not found")
+	ErrUserExists      = errors.New("user already exists")
+	ErrUserNotFound    = errors.New("user not found")
+	errInboundNotFound = errors.New("inbound not found")
 )
 
 type UserRecord struct {
@@ -36,13 +37,15 @@ type BulkUserResult struct {
 }
 
 type ConfigStore struct {
-	path       string
-	inboundTag string
-	flow       string
-	runtime    XrayRuntime
-	liveAPI    XrayLiveAPI
-	vlessPort  int
-	mu         sync.Mutex
+	path         string
+	inboundTag   string
+	flow         string
+	runtime      XrayRuntime
+	liveAPI      XrayLiveAPI
+	vlessPort    int
+	wsInboundTag string
+	wsPort       int
+	mu           sync.Mutex
 }
 
 // userDelta is the exact set of users a mutation added or removed. The live
@@ -67,6 +70,17 @@ func NewConfigStore(path, inboundTag, flow string, runtime XrayRuntime) *ConfigS
 func (s *ConfigStore) WithLiveAPI(api XrayLiveAPI, vlessPort int) *ConfigStore {
 	s.liveAPI = api
 	s.vlessPort = vlessPort
+	return s
+}
+
+// WithWsInbound mirrors every user mutation into a second VLESS inbound —
+// the ws+Cloudflare-Tunnel transport running alongside REALITY on nodes that
+// have it. Without this, a node's ws-in inbound never receives newly added,
+// rotated, or removed users: it silently drifts from the REALITY inbound it
+// is supposed to carry the same identities as.
+func (s *ConfigStore) WithWsInbound(tag string, port int) *ConfigStore {
+	s.wsInboundTag = tag
+	s.wsPort = port
 	return s
 }
 
@@ -164,6 +178,11 @@ func (s *ConfigStore) AddBulk(names []string) ([]BulkUserResult, error) {
 		return results, nil
 	}
 	users.commit()
+	if err := s.mirrorWsUsers(document, func(ws *userList) {
+		addUsersToList(ws, added, "")
+	}); err != nil {
+		return nil, err
+	}
 	if err := s.persistAndApply(document, original, userDelta{added: added}); err != nil {
 		return nil, err
 	}
@@ -203,6 +222,11 @@ func (s *ConfigStore) Delete(name string) error {
 	}
 	users.values = filtered
 	users.commit()
+	if err := s.mirrorWsUsers(document, func(ws *userList) {
+		removeUsersFromList(ws, []string{name})
+	}); err != nil {
+		return err
+	}
 	return s.persistAndApply(document, original, userDelta{removed: []string{name}})
 }
 
@@ -258,6 +282,11 @@ func (s *ConfigStore) Rotate(name string) (UserRecord, error) {
 
 	record := UserRecord{Name: name, UUID: id}
 	users.commit()
+	if err := s.mirrorWsUsers(document, func(ws *userList) {
+		rotateUserInList(ws, name, id)
+	}); err != nil {
+		return UserRecord{}, err
+	}
 	// Removal must precede the addition, or the live apply would register the
 	// new secret and then immediately revoke it by name. applyLive enforces
 	// that order.
@@ -296,6 +325,11 @@ func (s *ConfigStore) DeleteAll() (int, error) {
 	}
 	users.values = []any{}
 	users.commit()
+	if err := s.mirrorWsUsers(document, func(ws *userList) {
+		ws.values = []any{}
+	}); err != nil {
+		return 0, err
+	}
 	if err := s.persistAndApply(document, original, userDelta{removed: removed}); err != nil {
 		return 0, err
 	}
@@ -378,10 +412,20 @@ func (s *ConfigStore) applyLive(delta userDelta) error {
 		if err := s.liveAPI.RemoveUsers(s.inboundTag, delta.removed); err != nil {
 			return err
 		}
+		if s.wsInboundTag != "" {
+			if err := s.liveAPI.RemoveUsers(s.wsInboundTag, delta.removed); err != nil {
+				return err
+			}
+		}
 	}
 	if len(delta.added) > 0 {
 		if err := s.liveAPI.AddUsers(s.inboundTag, s.vlessPort, s.flow, delta.added); err != nil {
 			return err
+		}
+		if s.wsInboundTag != "" {
+			if err := s.liveAPI.AddUsers(s.wsInboundTag, s.wsPort, "", delta.added); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -481,7 +525,80 @@ func findUserList(document map[string]any, inboundTag string) (*userList, error)
 		}
 		return &userList{settings: settings, field: field, values: values}, nil
 	}
-	return nil, fmt.Errorf("VLESS inbound %q not found", inboundTag)
+	return nil, fmt.Errorf("%w: VLESS inbound %q", errInboundNotFound, inboundTag)
+}
+
+// mirrorWsUsers applies mutate to the ws inbound's user list, when this node
+// has one configured. A missing ws-in inbound is expected on nodes not yet
+// migrated to ws — skip rather than fail. Any other error (malformed
+// config, wrong protocol) still bubbles up: that is a real misconfiguration,
+// not an absence.
+func (s *ConfigStore) mirrorWsUsers(document map[string]any, mutate func(*userList)) error {
+	if s.wsInboundTag == "" {
+		return nil
+	}
+	list, err := findUserList(document, s.wsInboundTag)
+	if err != nil {
+		if errors.Is(err, errInboundNotFound) {
+			return nil
+		}
+		return err
+	}
+	mutate(list)
+	list.commit()
+	return nil
+}
+
+func addUsersToList(list *userList, added []UserRecord, flow string) {
+	existing := make(map[string]struct{}, len(list.values))
+	for _, raw := range list.values {
+		if user, ok := raw.(map[string]any); ok {
+			existing[stringValue(user["email"])] = struct{}{}
+		}
+	}
+	for _, record := range added {
+		if _, found := existing[record.Name]; found {
+			continue
+		}
+		user := map[string]any{"id": record.UUID, "email": record.Name}
+		if flow != "" {
+			user["flow"] = flow
+		}
+		list.values = append(list.values, user)
+		existing[record.Name] = struct{}{}
+	}
+}
+
+func removeUsersFromList(list *userList, names []string) {
+	if len(names) == 0 {
+		return
+	}
+	remove := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		remove[name] = struct{}{}
+	}
+	filtered := make([]any, 0, len(list.values))
+	for _, raw := range list.values {
+		if user, ok := raw.(map[string]any); ok {
+			if _, found := remove[stringValue(user["email"])]; found {
+				continue
+			}
+		}
+		filtered = append(filtered, raw)
+	}
+	list.values = filtered
+}
+
+func rotateUserInList(list *userList, name, newID string) {
+	for _, raw := range list.values {
+		if user, ok := raw.(map[string]any); ok && stringValue(user["email"]) == name {
+			user["id"] = newID
+			return
+		}
+	}
+	// Not present yet -- e.g. ws-in was added to this node after this user
+	// was created. Add it fresh rather than silently leaving it missing.
+	list.values = append(list.values, map[string]any{"id": newID, "email": name})
 }
 
 func decodeUserRecords(values []any) ([]UserRecord, error) {

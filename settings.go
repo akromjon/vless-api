@@ -57,6 +57,8 @@ type AppSettings struct {
 	Flow             string
 	Fingerprint      string
 	XrayAPIAddress   string
+	WsInboundTag     string
+	WsPort           int
 }
 
 func loadSettings() (AppSettings, error) {
@@ -77,6 +79,8 @@ func loadSettings() (AppSettings, error) {
 		Flow:             envOr("VLESS_FLOW", defaultFlow),
 		Fingerprint:      strings.ToLower(envOr("VLESS_FINGERPRINT", defaultFingerprint)),
 		XrayAPIAddress:   strings.TrimSpace(envOr("XRAY_API_ADDRESS", defaultAPIServer)),
+		WsInboundTag:     strings.TrimSpace(os.Getenv("WS_INBOUND_TAG")),
+		WsPort:           intEnvOr("WS_PORT", 0),
 	}
 
 	if err := settings.Validate(); err != nil {
@@ -117,6 +121,14 @@ func (s AppSettings) Validate() error {
 	}
 	if strings.TrimSpace(s.XrayConfigFile) == "" || strings.TrimSpace(s.InboundTag) == "" {
 		return fmt.Errorf("XRAY_CONFIG_FILE and VLESS_INBOUND_TAG are required")
+	}
+	if s.WsInboundTag != "" {
+		if s.WsInboundTag == s.InboundTag {
+			return fmt.Errorf("WS_INBOUND_TAG must differ from VLESS_INBOUND_TAG")
+		}
+		if s.WsPort < 1 || s.WsPort > 65535 {
+			return fmt.Errorf("WS_PORT must be between 1 and 65535 when WS_INBOUND_TAG is set")
+		}
 	}
 	return nil
 }

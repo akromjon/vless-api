@@ -38,6 +38,9 @@ func main() {
 	if liveEnabled {
 		store = store.WithLiveAPI(liveAPI, settings.VLESSPort)
 	}
+	if settings.WsInboundTag != "" {
+		store = store.WithWsInbound(settings.WsInboundTag, settings.WsPort)
+	}
 	if _, err := store.List(); err != nil {
 		log.Fatalf("cannot load managed Xray users: %v", err)
 	}
@@ -70,6 +73,9 @@ func main() {
 		log.Printf("Xray gRPC API at %s: user changes apply without a restart", settings.XrayAPIAddress)
 	} else {
 		log.Printf("Xray gRPC API disabled: every user change restarts Xray and drops live sessions")
+	}
+	if settings.WsInboundTag != "" {
+		log.Printf("Mirroring every user change into ws inbound %q as well", settings.WsInboundTag)
 	}
 	log.Printf("VLESS API listening on %s and managing inbound %q", settings.APIListenAddress(), settings.InboundTag)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

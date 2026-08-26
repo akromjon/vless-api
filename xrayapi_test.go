@@ -11,28 +11,32 @@ import (
 // fakeLiveAPI records what the store asked the running Xray to do, so a test
 // can assert that a mutation went through HandlerService instead of a restart.
 type fakeLiveAPI struct {
-	available bool
-	added     [][]UserRecord
-	removed   [][]string
-	addErr    error
-	removeErr error
-	traffic   []UserTraffic
-	statsErr  error
-	probeErr  error
-	resetSeen []bool
+	available   bool
+	added       [][]UserRecord
+	addedTags   []string
+	removed     [][]string
+	removedTags []string
+	addErr      error
+	removeErr   error
+	traffic     []UserTraffic
+	statsErr    error
+	probeErr    error
+	resetSeen   []bool
 }
 
 func (f *fakeLiveAPI) Available() bool { return f.available }
 
 func (f *fakeLiveAPI) Probe(string) error { return f.probeErr }
 
-func (f *fakeLiveAPI) AddUsers(_ string, _ int, _ string, users []UserRecord) error {
+func (f *fakeLiveAPI) AddUsers(tag string, _ int, _ string, users []UserRecord) error {
 	f.added = append(f.added, users)
+	f.addedTags = append(f.addedTags, tag)
 	return f.addErr
 }
 
-func (f *fakeLiveAPI) RemoveUsers(_ string, names []string) error {
+func (f *fakeLiveAPI) RemoveUsers(tag string, names []string) error {
 	f.removed = append(f.removed, names)
+	f.removedTags = append(f.removedTags, tag)
 	return f.removeErr
 }
 
