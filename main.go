@@ -44,6 +44,21 @@ func main() {
 	if _, err := store.List(); err != nil {
 		log.Fatalf("cannot load managed Xray users: %v", err)
 	}
+	// Self-heal ws parity before serving. A node freshly migrated to ws has an
+	// empty ws-in beside a fully populated REALITY inbound, and every existing
+	// user is rejected over ws until they match.
+	if settings.WsInboundTag != "" {
+		result, err := store.ReconcileWsInbound()
+		switch {
+		case err != nil:
+			// Not fatal: REALITY still serves every user, and refusing to
+			// start would take the node's whole management API down with it.
+			log.Printf("could not reconcile inbound %q: %v", settings.WsInboundTag, err)
+		case result.changed():
+			log.Printf("reconciled inbound %q to %d users (file updated: %t, registered live: %d)",
+				settings.WsInboundTag, result.Primary, result.FileUpdated, result.LiveAdded)
+		}
+	}
 
 	api := NewAPIServer(settings, store, runtime)
 	if liveEnabled {

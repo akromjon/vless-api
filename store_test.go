@@ -538,3 +538,174 @@ func TestConfigStoreMirrorsLiveApplyToWsInbound(t *testing.T) {
 		t.Fatalf("expected RemoveUsers on both inbounds, got tags=%#v", live.removedTags)
 	}
 }
+
+// The migration case this exists for: ws-in is added empty beside a REALITY
+// inbound that already serves users. Without reconciliation every one of them
+// is rejected over ws, because WithWsInbound only mirrors NEW mutations.
+func TestReconcileBackfillsExistingUsersIntoEmptyWsInbound(t *testing.T) {
+	path := writeTestConfigWithWs(t)
+	runtime := &fakeRuntime{active: true}
+	store := NewConfigStore(path, defaultInboundTag, defaultFlow, runtime)
+	if _, err := store.AddBulk([]string{"device_1", "device_2", "device_3"}); err != nil {
+		t.Fatalf("AddBulk returned error: %v", err)
+	}
+	// Simulate the pre-migration state: the primary inbound is populated and
+	// ws-in is empty, exactly as a hot-added inbound arrives.
+	emptyWsInbound(t, path)
+
+	live := &fakeLiveAPI{available: true}
+	store = NewConfigStore(path, defaultInboundTag, defaultFlow, runtime).
+		WithLiveAPI(live, 443).
+		WithWsInbound(wsInboundTag, 8080)
+
+	result, err := store.ReconcileWsInbound()
+	if err != nil {
+		t.Fatalf("ReconcileWsInbound returned error: %v", err)
+	}
+	if !result.FileUpdated || result.Primary != 3 || result.LiveAdded != 3 {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	if ws := readInboundClients(t, path, wsInboundTag); len(ws) != 3 {
+		t.Fatalf("expected ws-in backfilled to 3 users on disk, got %d", len(ws))
+	}
+	if len(live.added) != 1 || live.addedTags[0] != wsInboundTag {
+		t.Fatalf("expected one live AddUsers against ws-in, got tags=%#v", live.addedTags)
+	}
+	for _, user := range readInboundClients(t, path, wsInboundTag) {
+		if _, hasFlow := user.(map[string]any)["flow"]; hasFlow {
+			t.Fatalf("ws-in must not carry a flow field, got %#v", user)
+		}
+	}
+}
+
+// Reconciliation runs on every start, so at parity it must be a no-op: no
+// rewrite of the file, and nothing pushed to the live process.
+func TestReconcileIsIdempotentAtParity(t *testing.T) {
+	path := writeTestConfigWithWs(t)
+	runtime := &fakeRuntime{active: true}
+	store := NewConfigStore(path, defaultInboundTag, defaultFlow, runtime).
+		WithWsInbound(wsInboundTag, 8080)
+	if _, err := store.AddBulk([]string{"device_1", "device_2"}); err != nil {
+		t.Fatalf("AddBulk returned error: %v", err)
+	}
+
+	live := &fakeLiveAPI{available: true, liveUsers: []string{"device_1", "device_2"}}
+	store = NewConfigStore(path, defaultInboundTag, defaultFlow, runtime).
+		WithLiveAPI(live, 443).
+		WithWsInbound(wsInboundTag, 8080)
+
+	result, err := store.ReconcileWsInbound()
+	if err != nil {
+		t.Fatalf("ReconcileWsInbound returned error: %v", err)
+	}
+	if result.changed() {
+		t.Fatalf("expected a no-op at parity, got %#v", result)
+	}
+	if len(live.added) != 0 {
+		t.Fatalf("expected nothing pushed live, got %#v", live.added)
+	}
+}
+
+// The live process can hold users the file does not, from an out-of-band
+// `xray api adu`. Those must not be re-sent: adu aborts the whole batch on the
+// first duplicate, which would leave the genuinely missing users unregistered.
+func TestReconcileSkipsUsersTheLiveProcessAlreadyHas(t *testing.T) {
+	path := writeTestConfigWithWs(t)
+	runtime := &fakeRuntime{active: true}
+	store := NewConfigStore(path, defaultInboundTag, defaultFlow, runtime)
+	if _, err := store.AddBulk([]string{"device_1", "device_2", "device_3"}); err != nil {
+		t.Fatalf("AddBulk returned error: %v", err)
+	}
+	emptyWsInbound(t, path)
+
+	live := &fakeLiveAPI{available: true, liveUsers: []string{"device_1", "device_3"}}
+	store = NewConfigStore(path, defaultInboundTag, defaultFlow, runtime).
+		WithLiveAPI(live, 443).
+		WithWsInbound(wsInboundTag, 8080)
+
+	result, err := store.ReconcileWsInbound()
+	if err != nil {
+		t.Fatalf("ReconcileWsInbound returned error: %v", err)
+	}
+	if result.LiveAdded != 1 {
+		t.Fatalf("expected exactly the one missing user pushed live, got %#v", result)
+	}
+	if len(live.added) != 1 || len(live.added[0]) != 1 || live.added[0][0].Name != "device_2" {
+		t.Fatalf("expected only device_2 pushed live, got %#v", live.added)
+	}
+}
+
+// A node not yet migrated to ws has no ws-in inbound at all. Reconciliation
+// must leave it completely alone rather than treating the absence as an error.
+func TestReconcileLeavesUnmigratedNodeUntouched(t *testing.T) {
+	path := writeTestConfig(t)
+	runtime := &fakeRuntime{active: true}
+	live := &fakeLiveAPI{available: true}
+	store := NewConfigStore(path, defaultInboundTag, defaultFlow, runtime).
+		WithLiveAPI(live, 443).
+		WithWsInbound(wsInboundTag, 8080)
+	if _, err := store.AddBulk([]string{"device_1"}); err != nil {
+		t.Fatalf("AddBulk returned error: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := store.ReconcileWsInbound()
+	if err != nil {
+		t.Fatalf("expected a missing ws-in inbound to be tolerated, got: %v", err)
+	}
+	if result.changed() {
+		t.Fatalf("expected a no-op without a ws inbound, got %#v", result)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("config file must not be rewritten on a node without ws-in")
+	}
+}
+
+// A store with no ws inbound configured must not call the live API at all.
+func TestReconcileWithoutWsConfiguredDoesNothing(t *testing.T) {
+	live := &fakeLiveAPI{available: true}
+	store := NewConfigStore(writeTestConfigWithWs(t), defaultInboundTag, defaultFlow, &fakeRuntime{active: true}).
+		WithLiveAPI(live, 443)
+
+	result, err := store.ReconcileWsInbound()
+	if err != nil {
+		t.Fatalf("ReconcileWsInbound returned error: %v", err)
+	}
+	if result.changed() || len(live.inboundUsersTags) != 0 {
+		t.Fatalf("expected a complete no-op, got result=%#v tags=%#v", result, live.inboundUsersTags)
+	}
+}
+
+// emptyWsInbound clears ws-in on disk, reproducing a hot-added inbound that
+// arrives with no users while the primary inbound is already populated.
+func emptyWsInbound(t *testing.T, path string) {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(raw, &document); err != nil {
+		t.Fatal(err)
+	}
+	for _, rawInbound := range document["inbounds"].([]any) {
+		inbound := rawInbound.(map[string]any)
+		if stringValue(inbound["tag"]) == wsInboundTag {
+			inbound["settings"].(map[string]any)["clients"] = []any{}
+		}
+	}
+	encoded, err := json.MarshalIndent(document, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(encoded, '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+}

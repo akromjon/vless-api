@@ -23,6 +23,7 @@ import (
 type XrayLiveAPI interface {
 	AddUsers(inboundTag string, port int, flow string, users []UserRecord) error
 	RemoveUsers(inboundTag string, names []string) error
+	InboundUsers(inboundTag string) ([]string, error)
 	UserTraffic(reset bool) ([]UserTraffic, error)
 	Probe(inboundTag string) error
 	Available() bool
@@ -119,6 +120,37 @@ func (c CommandLiveAPI) RemoveUsers(inboundTag string, names []string) error {
 		return err
 	}
 	return nil
+}
+
+// InboundUsers lists the names the RUNNING Xray currently accepts on an
+// inbound. The file and the live process can disagree -- a live apply that
+// never reached disk, or a restart that reloaded a file the live process had
+// moved past -- and `adu` aborts the whole batch on the first duplicate, so
+// reconciliation needs the live set, not the file's.
+func (c CommandLiveAPI) InboundUsers(inboundTag string) ([]string, error) {
+	output, err := c.run("inbounduser", "-tag="+inboundTag)
+	if err != nil {
+		return nil, err
+	}
+	trimmed := strings.TrimSpace(output)
+	if trimmed == "" {
+		return []string{}, nil
+	}
+	var document struct {
+		Users []struct {
+			Email string `json:"email"`
+		} `json:"users"`
+	}
+	if err := json.Unmarshal([]byte(trimmed), &document); err != nil {
+		return nil, fmt.Errorf("parse Xray inbounduser output: %w", err)
+	}
+	names := make([]string, 0, len(document.Users))
+	for _, user := range document.Users {
+		if user.Email != "" {
+			names = append(names, user.Email)
+		}
+	}
+	return names, nil
 }
 
 // UserTraffic reads the per-user counters. Names come back inside stat keys

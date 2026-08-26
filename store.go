@@ -88,6 +88,130 @@ func (s *ConfigStore) Path() string {
 	return s.path
 }
 
+// ReconcileWsInbound brings the ws inbound to parity with the primary one, on
+// disk and in the running process.
+//
+// WithWsInbound only mirrors mutations as they happen, which leaves a node
+// wrong the moment ws-in is introduced: it is added empty beside a REALITY
+// inbound that already serves hundreds of users, and none of them are ever
+// registered on it. Every one of those users is then rejected over ws with
+// "invalid request user id".
+//
+// Drift the other way is just as real. A live apply is not persisted by Xray,
+// so an operator's out-of-band `xray api adu` disappears at the next restart,
+// when Xray reloads a file that never learned about it.
+//
+// Running this at startup makes both self-healing: migrating a node to ws
+// becomes "add the inbound, restart vless-api", and any drift is corrected on
+// the next boot. It is idempotent -- at parity it writes and sends nothing.
+func (s *ConfigStore) ReconcileWsInbound() (reconcileResult, error) {
+	if s.wsInboundTag == "" {
+		return reconcileResult{}, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	document, original, err := s.load()
+	if err != nil {
+		return reconcileResult{}, err
+	}
+	primary, err := findUserList(document, s.inboundTag)
+	if err != nil {
+		return reconcileResult{}, err
+	}
+	ws, err := findUserList(document, s.wsInboundTag)
+	if err != nil {
+		// Not every node has been migrated to ws. An absent inbound is the
+		// expected state there, not a misconfiguration.
+		if errors.Is(err, errInboundNotFound) {
+			return reconcileResult{}, nil
+		}
+		return reconcileResult{}, err
+	}
+
+	target, err := decodeUserRecords(primary.values)
+	if err != nil {
+		return reconcileResult{}, err
+	}
+	result := reconcileResult{Primary: len(target), WsBefore: len(ws.values)}
+
+	// The file is rebuilt from the primary inbound rather than diffed into,
+	// so a ws-in holding entries the primary no longer has loses them too.
+	fileChanged := !sameUserSet(ws.values, target)
+	if fileChanged {
+		ws.values = ws.values[:0]
+		addUsersToList(ws, target, "")
+		ws.commit()
+		if err := s.persist(document, original); err != nil {
+			return result, err
+		}
+		result.FileUpdated = true
+	}
+
+	if s.liveAPI == nil || !s.liveAPI.Available() {
+		return result, nil
+	}
+	liveNames, err := s.liveAPI.InboundUsers(s.wsInboundTag)
+	if err != nil {
+		return result, fmt.Errorf("read live %s users: %w", s.wsInboundTag, err)
+	}
+	live := make(map[string]struct{}, len(liveNames))
+	for _, name := range liveNames {
+		live[name] = struct{}{}
+	}
+	missing := make([]UserRecord, 0)
+	for _, record := range target {
+		if _, found := live[record.Name]; !found {
+			missing = append(missing, record)
+		}
+	}
+	result.LiveBefore = len(liveNames)
+	result.LiveAdded = len(missing)
+	if len(missing) == 0 {
+		return result, nil
+	}
+	// Only additions: a live user the primary inbound has dropped is already
+	// revoked on the transport that matters, and removing it here would risk
+	// cutting an established ws session on a name the file disagrees about.
+	if err := s.liveAPI.AddUsers(s.wsInboundTag, s.wsPort, "", missing); err != nil {
+		return result, fmt.Errorf("register missing %s users: %w", s.wsInboundTag, err)
+	}
+	return result, nil
+}
+
+type reconcileResult struct {
+	Primary     int
+	WsBefore    int
+	FileUpdated bool
+	LiveBefore  int
+	LiveAdded   int
+}
+
+func (r reconcileResult) changed() bool {
+	return r.FileUpdated || r.LiveAdded > 0
+}
+
+func sameUserSet(values []any, target []UserRecord) bool {
+	if len(values) != len(target) {
+		return false
+	}
+	have := make(map[string]string, len(values))
+	for _, raw := range values {
+		user, ok := raw.(map[string]any)
+		if !ok {
+			return false
+		}
+		have[stringValue(user["email"])] = stringValue(user["id"])
+	}
+	for _, record := range target {
+		if have[record.Name] != record.UUID {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *ConfigStore) List() ([]UserRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -346,6 +470,25 @@ func (s *ConfigStore) load() (map[string]any, []byte, error) {
 		return nil, nil, fmt.Errorf("parse Xray config: %w", err)
 	}
 	return document, original, nil
+}
+
+// persist writes the configuration and nothing else. Reconciliation uses it
+// because it drives the live process itself, from the live process's own user
+// list, rather than from a delta the file write could describe.
+func (s *ConfigStore) persist(document map[string]any, original []byte) error {
+	updated, err := json.MarshalIndent(document, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode Xray config: %w", err)
+	}
+	updated = append(updated, '\n')
+	mode, uid, gid := s.fileOwnership()
+	if err := writeAtomic(s.path, updated, mode, uid, gid, s.runtime.Validate); err != nil {
+		// Leave the file exactly as it was found; a half-written ws-in is
+		// worse than a stale one.
+		_ = writeAtomic(s.path, original, mode, uid, gid, s.runtime.Validate)
+		return err
+	}
+	return nil
 }
 
 // persistAndApply writes the new configuration, then brings the RUNNING Xray

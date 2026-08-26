@@ -22,6 +22,10 @@ type fakeLiveAPI struct {
 	statsErr    error
 	probeErr    error
 	resetSeen   []bool
+
+	liveUsers        []string
+	liveUsersErr     error
+	inboundUsersTags []string
 }
 
 func (f *fakeLiveAPI) Available() bool { return f.available }
@@ -38,6 +42,11 @@ func (f *fakeLiveAPI) RemoveUsers(tag string, names []string) error {
 	f.removed = append(f.removed, names)
 	f.removedTags = append(f.removedTags, tag)
 	return f.removeErr
+}
+
+func (f *fakeLiveAPI) InboundUsers(tag string) ([]string, error) {
+	f.inboundUsersTags = append(f.inboundUsersTags, tag)
+	return f.liveUsers, f.liveUsersErr
 }
 
 func (f *fakeLiveAPI) UserTraffic(reset bool) ([]UserTraffic, error) {
