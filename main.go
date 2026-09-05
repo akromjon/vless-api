@@ -41,22 +41,25 @@ func main() {
 	if settings.WsInboundTag != "" {
 		store = store.WithWsInbound(settings.WsInboundTag, settings.WsPort)
 	}
+	if len(settings.ExtraInbounds) > 0 {
+		store = store.WithMirrorInbounds(settings.ExtraInbounds)
+	}
 	if _, err := store.List(); err != nil {
 		log.Fatalf("cannot load managed Xray users: %v", err)
 	}
-	// Self-heal ws parity before serving. A node freshly migrated to ws has an
-	// empty ws-in beside a fully populated REALITY inbound, and every existing
-	// user is rejected over ws until they match.
-	if settings.WsInboundTag != "" {
-		result, err := store.ReconcileWsInbound()
-		switch {
-		case err != nil:
-			// Not fatal: REALITY still serves every user, and refusing to
-			// start would take the node's whole management API down with it.
-			log.Printf("could not reconcile inbound %q: %v", settings.WsInboundTag, err)
-		case result.changed():
-			log.Printf("reconciled inbound %q to %d users (file updated: %t, registered live: %d)",
-				settings.WsInboundTag, result.Primary, result.FileUpdated, result.LiveAdded)
+	// Self-heal mirror parity before serving. A node freshly given a mirror
+	// inbound has it empty beside a fully populated REALITY inbound, and
+	// every existing user is rejected on that transport until they match.
+	if results, err := store.ReconcileMirrorInbounds(); err != nil {
+		// Not fatal: REALITY still serves every user, and refusing to start
+		// would take the node's whole management API down with it.
+		log.Printf("could not reconcile mirror inbounds: %v", err)
+	} else {
+		for _, result := range results {
+			if result.changed() {
+				log.Printf("reconciled inbound %q to %d users (file updated: %t, registered live: %d)",
+					result.Tag, result.Primary, result.FileUpdated, result.LiveAdded)
+			}
 		}
 	}
 
@@ -91,6 +94,9 @@ func main() {
 	}
 	if settings.WsInboundTag != "" {
 		log.Printf("Mirroring every user change into ws inbound %q as well", settings.WsInboundTag)
+	}
+	for _, mirror := range settings.ExtraInbounds {
+		log.Printf("Mirroring every user change into inbound %q as well", mirror.Tag)
 	}
 	log.Printf("VLESS API listening on %s and managing inbound %q", settings.APIListenAddress(), settings.InboundTag)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

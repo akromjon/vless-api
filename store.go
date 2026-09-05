@@ -37,15 +37,14 @@ type BulkUserResult struct {
 }
 
 type ConfigStore struct {
-	path         string
-	inboundTag   string
-	flow         string
-	runtime      XrayRuntime
-	liveAPI      XrayLiveAPI
-	vlessPort    int
-	wsInboundTag string
-	wsPort       int
-	mu           sync.Mutex
+	path       string
+	inboundTag string
+	flow       string
+	runtime    XrayRuntime
+	liveAPI    XrayLiveAPI
+	vlessPort  int
+	mirrors    []mirrorInbound
+	mu         sync.Mutex
 }
 
 // userDelta is the exact set of users a mutation added or removed. The live
@@ -79,8 +78,16 @@ func (s *ConfigStore) WithLiveAPI(api XrayLiveAPI, vlessPort int) *ConfigStore {
 // rotated, or removed users: it silently drifts from the REALITY inbound it
 // is supposed to carry the same identities as.
 func (s *ConfigStore) WithWsInbound(tag string, port int) *ConfigStore {
-	s.wsInboundTag = tag
-	s.wsPort = port
+	s.mirrors = append(s.mirrors, mirrorInbound{Tag: tag, Port: port})
+	return s
+}
+
+// WithMirrorInbounds mirrors every user mutation into additional VLESS
+// inbounds beside whatever WithWsInbound already registered — e.g. grpc-in
+// and xhttp-in carrying the same client list as ws-in and REALITY, flow
+// stripped.
+func (s *ConfigStore) WithMirrorInbounds(mirrors []mirrorInbound) *ConfigStore {
+	s.mirrors = append(s.mirrors, mirrors...)
 	return s
 }
 
@@ -88,30 +95,54 @@ func (s *ConfigStore) Path() string {
 	return s.path
 }
 
-// ReconcileWsInbound brings the ws inbound to parity with the primary one, on
-// disk and in the running process.
+// ReconcileMirrorInbounds brings every configured mirror inbound (ws-in,
+// grpc-in, xhttp-in, ...) to parity with the primary one, on disk and in the
+// running process, one mirror at a time.
 //
-// WithWsInbound only mirrors mutations as they happen, which leaves a node
-// wrong the moment ws-in is introduced: it is added empty beside a REALITY
-// inbound that already serves hundreds of users, and none of them are ever
-// registered on it. Every one of those users is then rejected over ws with
-// "invalid request user id".
+// WithWsInbound / WithMirrorInbounds only mirror mutations as they happen,
+// which leaves a node wrong the moment a mirror inbound is introduced: it is
+// added empty beside a REALITY inbound that already serves hundreds of
+// users, and none of them are ever registered on it. Every one of those
+// users is then rejected over that transport with "invalid request user id".
 //
 // Drift the other way is just as real. A live apply is not persisted by Xray,
 // so an operator's out-of-band `xray api adu` disappears at the next restart,
 // when Xray reloads a file that never learned about it.
 //
-// Running this at startup makes both self-healing: migrating a node to ws
+// Running this at startup makes both self-healing: adding a mirror inbound
 // becomes "add the inbound, restart vless-api", and any drift is corrected on
 // the next boot. It is idempotent -- at parity it writes and sends nothing.
-func (s *ConfigStore) ReconcileWsInbound() (reconcileResult, error) {
-	if s.wsInboundTag == "" {
-		return reconcileResult{}, nil
+func (s *ConfigStore) ReconcileMirrorInbounds() ([]reconcileResult, error) {
+	if len(s.mirrors) == 0 {
+		return nil, nil
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	results := make([]reconcileResult, 0, len(s.mirrors))
+	for _, mirror := range s.mirrors {
+		result, err := s.reconcileMirror(mirror)
+		if err != nil {
+			return results, err
+		}
+		results = append(results, result)
+	}
+	return results, nil
+}
+
+// ReconcileWsInbound is kept for callers that predate multi-mirror support.
+func (s *ConfigStore) ReconcileWsInbound() (reconcileResult, error) {
+	results, err := s.ReconcileMirrorInbounds()
+	if err != nil || len(results) == 0 {
+		return reconcileResult{}, err
+	}
+	return results[0], nil
+}
+
+// reconcileMirror runs the ReconcileMirrorInbounds body for a single mirror.
+// The caller already holds s.mu.
+func (s *ConfigStore) reconcileMirror(mirror mirrorInbound) (reconcileResult, error) {
 	document, original, err := s.load()
 	if err != nil {
 		return reconcileResult{}, err
@@ -120,12 +151,12 @@ func (s *ConfigStore) ReconcileWsInbound() (reconcileResult, error) {
 	if err != nil {
 		return reconcileResult{}, err
 	}
-	ws, err := findUserList(document, s.wsInboundTag)
+	mirrorList, err := findUserList(document, mirror.Tag)
 	if err != nil {
-		// Not every node has been migrated to ws. An absent inbound is the
+		// Not every node has every mirror inbound. An absent inbound is the
 		// expected state there, not a misconfiguration.
 		if errors.Is(err, errInboundNotFound) {
-			return reconcileResult{}, nil
+			return reconcileResult{Tag: mirror.Tag}, nil
 		}
 		return reconcileResult{}, err
 	}
@@ -134,15 +165,15 @@ func (s *ConfigStore) ReconcileWsInbound() (reconcileResult, error) {
 	if err != nil {
 		return reconcileResult{}, err
 	}
-	result := reconcileResult{Primary: len(target), WsBefore: len(ws.values)}
+	result := reconcileResult{Tag: mirror.Tag, Primary: len(target), WsBefore: len(mirrorList.values)}
 
 	// The file is rebuilt from the primary inbound rather than diffed into,
-	// so a ws-in holding entries the primary no longer has loses them too.
-	fileChanged := !sameUserSet(ws.values, target)
+	// so a mirror holding entries the primary no longer has loses them too.
+	fileChanged := !sameUserSet(mirrorList.values, target)
 	if fileChanged {
-		ws.values = ws.values[:0]
-		addUsersToList(ws, target, "")
-		ws.commit()
+		mirrorList.values = mirrorList.values[:0]
+		addUsersToList(mirrorList, target, "")
+		mirrorList.commit()
 		if err := s.persist(document, original); err != nil {
 			return result, err
 		}
@@ -152,9 +183,9 @@ func (s *ConfigStore) ReconcileWsInbound() (reconcileResult, error) {
 	if s.liveAPI == nil || !s.liveAPI.Available() {
 		return result, nil
 	}
-	liveNames, err := s.liveAPI.InboundUsers(s.wsInboundTag)
+	liveNames, err := s.liveAPI.InboundUsers(mirror.Tag)
 	if err != nil {
-		return result, fmt.Errorf("read live %s users: %w", s.wsInboundTag, err)
+		return result, fmt.Errorf("read live %s users: %w", mirror.Tag, err)
 	}
 	live := make(map[string]struct{}, len(liveNames))
 	for _, name := range liveNames {
@@ -173,14 +204,15 @@ func (s *ConfigStore) ReconcileWsInbound() (reconcileResult, error) {
 	}
 	// Only additions: a live user the primary inbound has dropped is already
 	// revoked on the transport that matters, and removing it here would risk
-	// cutting an established ws session on a name the file disagrees about.
-	if err := s.liveAPI.AddUsers(s.wsInboundTag, s.wsPort, "", missing); err != nil {
-		return result, fmt.Errorf("register missing %s users: %w", s.wsInboundTag, err)
+	// cutting an established session on a name the file disagrees about.
+	if err := s.liveAPI.AddUsers(mirror.Tag, mirror.Port, "", missing); err != nil {
+		return result, fmt.Errorf("register missing %s users: %w", mirror.Tag, err)
 	}
 	return result, nil
 }
 
 type reconcileResult struct {
+	Tag         string
 	Primary     int
 	WsBefore    int
 	FileUpdated bool
@@ -302,7 +334,7 @@ func (s *ConfigStore) AddBulk(names []string) ([]BulkUserResult, error) {
 		return results, nil
 	}
 	users.commit()
-	if err := s.mirrorWsUsers(document, func(ws *userList) {
+	if err := s.mirrorUsers(document, func(ws *userList) {
 		addUsersToList(ws, added, "")
 	}); err != nil {
 		return nil, err
@@ -346,7 +378,7 @@ func (s *ConfigStore) Delete(name string) error {
 	}
 	users.values = filtered
 	users.commit()
-	if err := s.mirrorWsUsers(document, func(ws *userList) {
+	if err := s.mirrorUsers(document, func(ws *userList) {
 		removeUsersFromList(ws, []string{name})
 	}); err != nil {
 		return err
@@ -406,7 +438,7 @@ func (s *ConfigStore) Rotate(name string) (UserRecord, error) {
 
 	record := UserRecord{Name: name, UUID: id}
 	users.commit()
-	if err := s.mirrorWsUsers(document, func(ws *userList) {
+	if err := s.mirrorUsers(document, func(ws *userList) {
 		rotateUserInList(ws, name, id)
 	}); err != nil {
 		return UserRecord{}, err
@@ -449,7 +481,7 @@ func (s *ConfigStore) DeleteAll() (int, error) {
 	}
 	users.values = []any{}
 	users.commit()
-	if err := s.mirrorWsUsers(document, func(ws *userList) {
+	if err := s.mirrorUsers(document, func(ws *userList) {
 		ws.values = []any{}
 	}); err != nil {
 		return 0, err
@@ -555,8 +587,8 @@ func (s *ConfigStore) applyLive(delta userDelta) error {
 		if err := s.liveAPI.RemoveUsers(s.inboundTag, delta.removed); err != nil {
 			return err
 		}
-		if s.wsInboundTag != "" {
-			if err := s.liveAPI.RemoveUsers(s.wsInboundTag, delta.removed); err != nil {
+		for _, mirror := range s.mirrors {
+			if err := s.liveAPI.RemoveUsers(mirror.Tag, delta.removed); err != nil {
 				return err
 			}
 		}
@@ -565,8 +597,8 @@ func (s *ConfigStore) applyLive(delta userDelta) error {
 		if err := s.liveAPI.AddUsers(s.inboundTag, s.vlessPort, s.flow, delta.added); err != nil {
 			return err
 		}
-		if s.wsInboundTag != "" {
-			if err := s.liveAPI.AddUsers(s.wsInboundTag, s.wsPort, "", delta.added); err != nil {
+		for _, mirror := range s.mirrors {
+			if err := s.liveAPI.AddUsers(mirror.Tag, mirror.Port, "", delta.added); err != nil {
 				return err
 			}
 		}
@@ -671,24 +703,23 @@ func findUserList(document map[string]any, inboundTag string) (*userList, error)
 	return nil, fmt.Errorf("%w: VLESS inbound %q", errInboundNotFound, inboundTag)
 }
 
-// mirrorWsUsers applies mutate to the ws inbound's user list, when this node
-// has one configured. A missing ws-in inbound is expected on nodes not yet
-// migrated to ws — skip rather than fail. Any other error (malformed
-// config, wrong protocol) still bubbles up: that is a real misconfiguration,
-// not an absence.
-func (s *ConfigStore) mirrorWsUsers(document map[string]any, mutate func(*userList)) error {
-	if s.wsInboundTag == "" {
-		return nil
-	}
-	list, err := findUserList(document, s.wsInboundTag)
-	if err != nil {
-		if errors.Is(err, errInboundNotFound) {
-			return nil
+// mirrorUsers applies mutate to every configured mirror inbound's user list
+// (ws-in, grpc-in, xhttp-in, ...). A missing mirror inbound is expected on a
+// node that has not been given it yet — skip rather than fail. Any other
+// error (malformed config, wrong protocol) still bubbles up: that is a real
+// misconfiguration, not an absence.
+func (s *ConfigStore) mirrorUsers(document map[string]any, mutate func(*userList)) error {
+	for _, mirror := range s.mirrors {
+		list, err := findUserList(document, mirror.Tag)
+		if err != nil {
+			if errors.Is(err, errInboundNotFound) {
+				continue
+			}
+			return err
 		}
-		return err
+		mutate(list)
+		list.commit()
 	}
-	mutate(list)
-	list.commit()
 	return nil
 }
 

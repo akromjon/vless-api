@@ -59,9 +59,47 @@ type AppSettings struct {
 	XrayAPIAddress   string
 	WsInboundTag     string
 	WsPort           int
+	ExtraInbounds    []mirrorInbound
+}
+
+// mirrorInbound names one extra VLESS inbound whose client list is kept in
+// sync with the primary inbound's, flow stripped, exactly like ws-in.
+type mirrorInbound struct {
+	Tag  string
+	Port int
+}
+
+// parseExtraInbounds reads "tag:port,tag:port". Every entry becomes a mirror
+// of the primary inbound's user list (flow stripped), exactly like ws-in.
+func parseExtraInbounds(raw string) ([]mirrorInbound, error) {
+	var out []mirrorInbound
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		tag, portText, ok := strings.Cut(part, ":")
+		if !ok {
+			return nil, fmt.Errorf("EXTRA_INBOUNDS entry %q must be tag:port", part)
+		}
+		port, err := strconv.Atoi(strings.TrimSpace(portText))
+		if err != nil || port < 1 || port > 65535 {
+			return nil, fmt.Errorf("EXTRA_INBOUNDS entry %q has an invalid port", part)
+		}
+		tag = strings.TrimSpace(tag)
+		if tag == defaultInboundTag {
+			return nil, fmt.Errorf("EXTRA_INBOUNDS must not include the primary inbound %q", tag)
+		}
+		out = append(out, mirrorInbound{Tag: tag, Port: port})
+	}
+	return out, nil
 }
 
 func loadSettings() (AppSettings, error) {
+	extraInbounds, err := parseExtraInbounds(os.Getenv("EXTRA_INBOUNDS"))
+	if err != nil {
+		return AppSettings{}, err
+	}
 	settings := AppSettings{
 		APIAddress:       envOr("API_ADDRESS", defaultAPIAddress),
 		APIPort:          intEnvOr("API_PORT", defaultAPIPort),
@@ -81,6 +119,7 @@ func loadSettings() (AppSettings, error) {
 		XrayAPIAddress:   strings.TrimSpace(envOr("XRAY_API_ADDRESS", defaultAPIServer)),
 		WsInboundTag:     strings.TrimSpace(os.Getenv("WS_INBOUND_TAG")),
 		WsPort:           intEnvOr("WS_PORT", 0),
+		ExtraInbounds:    extraInbounds,
 	}
 
 	if err := settings.Validate(); err != nil {
@@ -128,6 +167,14 @@ func (s AppSettings) Validate() error {
 		}
 		if s.WsPort < 1 || s.WsPort > 65535 {
 			return fmt.Errorf("WS_PORT must be between 1 and 65535 when WS_INBOUND_TAG is set")
+		}
+	}
+	for _, mirror := range s.ExtraInbounds {
+		if mirror.Tag == s.InboundTag {
+			return fmt.Errorf("EXTRA_INBOUNDS must not include the primary inbound %q", mirror.Tag)
+		}
+		if s.WsInboundTag != "" && mirror.Tag == s.WsInboundTag {
+			return fmt.Errorf("EXTRA_INBOUNDS must not duplicate WS_INBOUND_TAG %q", mirror.Tag)
 		}
 	}
 	return nil

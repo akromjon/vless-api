@@ -709,3 +709,84 @@ func emptyWsInbound(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 }
+
+func writeTestConfigWithMirrors(t *testing.T, tags ...string) string {
+	t.Helper()
+	inbounds := []any{map[string]any{
+		"tag": defaultInboundTag, "protocol": "vless",
+		"settings": map[string]any{"clients": []any{}, "decryption": "none"},
+	}}
+	for _, tag := range tags {
+		inbounds = append(inbounds, map[string]any{
+			"tag": tag, "protocol": "vless",
+			"settings": map[string]any{"clients": []any{}, "decryption": "none"},
+		})
+	}
+	document := map[string]any{
+		"log":       map[string]any{"loglevel": "warning"},
+		"inbounds":  inbounds,
+		"outbounds": []any{map[string]any{"protocol": "freedom"}},
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	raw, _ := json.Marshal(document)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// A node with grpc-in and xhttp-in beside ws-in must have every user
+// mirrored into all three, not just the single ws-in inbound WithWsInbound
+// alone would cover.
+func TestConfigStoreMirrorsIntoEveryExtraInbound(t *testing.T) {
+	path := writeTestConfigWithMirrors(t, wsInboundTag, "grpc-in", "xhttp-in")
+	store := NewConfigStore(path, defaultInboundTag, defaultFlow, &fakeRuntime{active: true}).
+		WithWsInbound(wsInboundTag, 28080).
+		WithMirrorInbounds([]mirrorInbound{{Tag: "grpc-in", Port: 8443}, {Tag: "xhttp-in", Port: 28081}})
+
+	if _, err := store.AddBulk([]string{"device_1", "device_2"}); err != nil {
+		t.Fatalf("AddBulk: %v", err)
+	}
+	for _, tag := range []string{wsInboundTag, "grpc-in", "xhttp-in"} {
+		clients := readInboundClients(t, path, tag)
+		if len(clients) != 2 {
+			t.Fatalf("%s: expected 2 mirrored users, got %d", tag, len(clients))
+		}
+		if _, hasFlow := clients[0].(map[string]any)["flow"]; hasFlow {
+			t.Fatalf("%s must not carry flow", tag)
+		}
+	}
+	if err := store.Delete("device_1"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	for _, tag := range []string{wsInboundTag, "grpc-in", "xhttp-in"} {
+		if n := len(readInboundClients(t, path, tag)); n != 1 {
+			t.Fatalf("%s: expected 1 after delete, got %d", tag, n)
+		}
+	}
+}
+
+// Reconciliation at startup must backfill every configured mirror, not just
+// the first one -- a node freshly given grpc-in and xhttp-in has both empty
+// beside an already-populated REALITY inbound.
+func TestReconcileBackfillsEveryExtraInbound(t *testing.T) {
+	path := writeTestConfigWithMirrors(t, "grpc-in", "xhttp-in")
+	seed := NewConfigStore(path, defaultInboundTag, defaultFlow, &fakeRuntime{active: true})
+	if _, err := seed.AddBulk([]string{"a", "b", "c"}); err != nil {
+		t.Fatal(err)
+	}
+	store := NewConfigStore(path, defaultInboundTag, defaultFlow, &fakeRuntime{active: true}).
+		WithMirrorInbounds([]mirrorInbound{{Tag: "grpc-in", Port: 8443}, {Tag: "xhttp-in", Port: 28081}})
+	results, err := store.ReconcileMirrorInbounds()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 || !results[0].FileUpdated || !results[1].FileUpdated {
+		t.Fatalf("expected both mirrors backfilled, got %#v", results)
+	}
+	for _, tag := range []string{"grpc-in", "xhttp-in"} {
+		if n := len(readInboundClients(t, path, tag)); n != 3 {
+			t.Fatalf("%s: expected 3, got %d", tag, n)
+		}
+	}
+}

@@ -19,3 +19,23 @@ func TestBuildShareURIUsesSeparateVLESSUUID(t *testing.T) {
 		t.Fatalf("unexpected Reality parameters: %s", parsed.RawQuery)
 	}
 }
+
+func TestParseExtraInbounds(t *testing.T) {
+	got, err := parseExtraInbounds("grpc-in:8443, xhttp-in:28081")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []mirrorInbound{{Tag: "grpc-in", Port: 8443}, {Tag: "xhttp-in", Port: 28081}}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("got %#v want %#v", got, want)
+	}
+	if _, err := parseExtraInbounds("grpc-in"); err == nil {
+		t.Fatal("missing port must error")
+	}
+	if _, err := parseExtraInbounds("vless-reality:443"); err == nil {
+		t.Fatal("primary tag must be rejected")
+	}
+	if got, _ := parseExtraInbounds(""); len(got) != 0 {
+		t.Fatalf("empty must yield no mirrors, got %#v", got)
+	}
+}
