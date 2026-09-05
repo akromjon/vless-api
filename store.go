@@ -53,6 +53,12 @@ type ConfigStore struct {
 type userDelta struct {
 	added   []UserRecord
 	removed []string
+	// mirrors is the set of mirror inbounds actually present in config.json at
+	// the time of this mutation (a subset of ConfigStore.mirrors). applyLive
+	// must touch only these: calling AddUsers/RemoveUsers on a mirror tag the
+	// node doesn't have turns "0 users changed" into an error over the live
+	// API, which then rolls the whole file back and restarts Xray.
+	mirrors []mirrorInbound
 }
 
 func (d userDelta) empty() bool {
@@ -334,12 +340,13 @@ func (s *ConfigStore) AddBulk(names []string) ([]BulkUserResult, error) {
 		return results, nil
 	}
 	users.commit()
-	if err := s.mirrorUsers(document, func(ws *userList) {
+	presentMirrors, err := s.mirrorUsers(document, func(ws *userList) {
 		addUsersToList(ws, added, "")
-	}); err != nil {
+	})
+	if err != nil {
 		return nil, err
 	}
-	if err := s.persistAndApply(document, original, userDelta{added: added}); err != nil {
+	if err := s.persistAndApply(document, original, userDelta{added: added, mirrors: presentMirrors}); err != nil {
 		return nil, err
 	}
 	return results, nil
@@ -378,12 +385,13 @@ func (s *ConfigStore) Delete(name string) error {
 	}
 	users.values = filtered
 	users.commit()
-	if err := s.mirrorUsers(document, func(ws *userList) {
+	presentMirrors, err := s.mirrorUsers(document, func(ws *userList) {
 		removeUsersFromList(ws, []string{name})
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
-	return s.persistAndApply(document, original, userDelta{removed: []string{name}})
+	return s.persistAndApply(document, original, userDelta{removed: []string{name}, mirrors: presentMirrors})
 }
 
 // Rotate issues a fresh VLESS UUID for an existing config name, revoking the
@@ -438,9 +446,10 @@ func (s *ConfigStore) Rotate(name string) (UserRecord, error) {
 
 	record := UserRecord{Name: name, UUID: id}
 	users.commit()
-	if err := s.mirrorUsers(document, func(ws *userList) {
+	presentMirrors, err := s.mirrorUsers(document, func(ws *userList) {
 		rotateUserInList(ws, name, id)
-	}); err != nil {
+	})
+	if err != nil {
 		return UserRecord{}, err
 	}
 	// Removal must precede the addition, or the live apply would register the
@@ -449,6 +458,7 @@ func (s *ConfigStore) Rotate(name string) (UserRecord, error) {
 	if err := s.persistAndApply(document, original, userDelta{
 		removed: []string{name},
 		added:   []UserRecord{record},
+		mirrors: presentMirrors,
 	}); err != nil {
 		return UserRecord{}, err
 	}
@@ -481,12 +491,13 @@ func (s *ConfigStore) DeleteAll() (int, error) {
 	}
 	users.values = []any{}
 	users.commit()
-	if err := s.mirrorUsers(document, func(ws *userList) {
+	presentMirrors, err := s.mirrorUsers(document, func(ws *userList) {
 		ws.values = []any{}
-	}); err != nil {
+	})
+	if err != nil {
 		return 0, err
 	}
-	if err := s.persistAndApply(document, original, userDelta{removed: removed}); err != nil {
+	if err := s.persistAndApply(document, original, userDelta{removed: removed, mirrors: presentMirrors}); err != nil {
 		return 0, err
 	}
 	return deleted, nil
@@ -587,7 +598,7 @@ func (s *ConfigStore) applyLive(delta userDelta) error {
 		if err := s.liveAPI.RemoveUsers(s.inboundTag, delta.removed); err != nil {
 			return err
 		}
-		for _, mirror := range s.mirrors {
+		for _, mirror := range delta.mirrors {
 			if err := s.liveAPI.RemoveUsers(mirror.Tag, delta.removed); err != nil {
 				return err
 			}
@@ -597,7 +608,7 @@ func (s *ConfigStore) applyLive(delta userDelta) error {
 		if err := s.liveAPI.AddUsers(s.inboundTag, s.vlessPort, s.flow, delta.added); err != nil {
 			return err
 		}
-		for _, mirror := range s.mirrors {
+		for _, mirror := range delta.mirrors {
 			if err := s.liveAPI.AddUsers(mirror.Tag, mirror.Port, "", delta.added); err != nil {
 				return err
 			}
@@ -708,19 +719,26 @@ func findUserList(document map[string]any, inboundTag string) (*userList, error)
 // node that has not been given it yet — skip rather than fail. Any other
 // error (malformed config, wrong protocol) still bubbles up: that is a real
 // misconfiguration, not an absence.
-func (s *ConfigStore) mirrorUsers(document map[string]any, mutate func(*userList)) error {
+//
+// It returns the subset of s.mirrors that were actually found in document, so
+// the caller can carry that exact set into applyLive: a mirror absent from
+// config.json today must stay untouched by the live API too, not just by the
+// file write.
+func (s *ConfigStore) mirrorUsers(document map[string]any, mutate func(*userList)) ([]mirrorInbound, error) {
+	found := make([]mirrorInbound, 0, len(s.mirrors))
 	for _, mirror := range s.mirrors {
 		list, err := findUserList(document, mirror.Tag)
 		if err != nil {
 			if errors.Is(err, errInboundNotFound) {
 				continue
 			}
-			return err
+			return found, err
 		}
 		mutate(list)
 		list.commit()
+		found = append(found, mirror)
 	}
-	return nil
+	return found, nil
 }
 
 func addUsersToList(list *userList, added []UserRecord, flow string) {

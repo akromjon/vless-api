@@ -790,3 +790,45 @@ func TestReconcileBackfillsEveryExtraInbound(t *testing.T) {
 		}
 	}
 }
+
+// A store can be configured with a mirror (e.g. grpc-in) that a given node's
+// config.json does not have yet -- the mirror was added to EXTRA_INBOUNDS
+// before the inbound itself was installed on that node, or the node predates
+// it entirely. mirrorUsers already treats that as expected and skips it in
+// the file write. applyLive must skip it too: calling AddUsers/RemoveUsers on
+// a tag Xray's live HandlerService has never heard of turns "0 users changed"
+// into an error, which then rolls the whole config file back and restarts
+// Xray -- dropping every session on the node for a mirror it was never
+// carrying in the first place.
+func TestApplyLiveSkipsMirrorsAbsentFromConfig(t *testing.T) {
+	path := writeTestConfigWithMirrors(t, wsInboundTag)
+	runtime := &fakeRuntime{active: true}
+	live := &fakeLiveAPI{available: true}
+	store := NewConfigStore(path, defaultInboundTag, defaultFlow, runtime).
+		WithLiveAPI(live, 443).
+		WithWsInbound(wsInboundTag, 28080).
+		WithMirrorInbounds([]mirrorInbound{{Tag: "grpc-in", Port: 8443}})
+
+	if _, err := store.AddBulk([]string{"a"}); err != nil {
+		t.Fatalf("AddBulk returned error: %v", err)
+	}
+	if runtime.restartCalls != 0 {
+		t.Fatalf("expected no restart, got %d", runtime.restartCalls)
+	}
+	seenTags := map[string]bool{}
+	for _, tag := range live.addedTags {
+		seenTags[tag] = true
+	}
+	if !seenTags[defaultInboundTag] {
+		t.Fatalf("expected AddUsers on the primary inbound, got tags %#v", live.addedTags)
+	}
+	if !seenTags[wsInboundTag] {
+		t.Fatalf("expected AddUsers on ws-in (present in config.json), got tags %#v", live.addedTags)
+	}
+	if seenTags["grpc-in"] {
+		t.Fatalf("grpc-in is absent from config.json; AddUsers must never be called for it, got tags %#v", live.addedTags)
+	}
+	if len(live.addedTags) != 2 {
+		t.Fatalf("expected exactly 2 AddUsers calls (primary + ws-in), got %#v", live.addedTags)
+	}
+}
